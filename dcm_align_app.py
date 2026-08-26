@@ -23,7 +23,16 @@ import os
 import random
 import math
 import threading
+import codecs
 from pathlib import Path
+
+# pyepics on Windows passes 'utf-8:surrogatescape' as a codec name, which Python rejects.
+# codecs.lookup normalises '-' → '_' before calling search functions, so the name
+# arrives as 'utf_8:surrogatescape'. Register an alias so epics can initialise correctly.
+try:
+    codecs.lookup('utf-8:surrogatescape')
+except LookupError:
+    codecs.register(lambda name: codecs.lookup('utf-8') if 'surrogateescape' in name else None)
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -35,7 +44,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox,
     QSplitter, QFrame, QFileDialog, QMessageBox, QProgressBar,
-    QAbstractItemView, QSizePolicy, QScrollArea, QStatusBar,
+    QAbstractItemView, QSizePolicy, QScrollArea, QStatusBar, QDialog,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QObject, QSettings, QSize,
@@ -53,18 +62,18 @@ except ImportError:
 
 # ─── Colour palette ──────────────────────────────────────────────────────────
 PAL = {
-    "bg":          "#0d1117",
-    "surface":     "#161b22",
-    "surface_hi":  "#21262d",
-    "border":      "#30363d",
-    "cyan":        "#39d0d8",
-    "cyan_dim":    "#1a3a3c",
-    "green":       "#3fb950",
-    "amber":       "#d29922",
-    "red":         "#f85149",
-    "text_pri":    "#e6edf3",
-    "text_sec":    "#8b949e",
-    "text_dim":    "#484f58",
+    "bg":          "#f5f7fa",
+    "surface":     "#eaeef2",
+    "surface_hi":  "#dde2e8",
+    "border":      "#c8d0d8",
+    "cyan":        "#0a7a82",
+    "cyan_dim":    "#c8eef0",
+    "green":       "#1a7f37",
+    "amber":       "#9a6700",
+    "red":         "#cf2218",
+    "text_pri":    "#1f2328",
+    "text_sec":    "#57606a",
+    "text_dim":    "#6e7781",
 }
 
 QSS = f"""
@@ -171,7 +180,7 @@ QPushButton#primary {{
     padding: 7px 20px;
 }}
 QPushButton#primary:hover {{
-    background: #4adde6;
+    background: #09686f;
     color: {PAL['bg']};
 }}
 QPushButton#primary:disabled {{
@@ -183,7 +192,7 @@ QPushButton#danger {{
     color: {PAL['red']};
 }}
 QPushButton#danger:hover {{
-    background: #2b0a0a;
+    background: #fce8e6;
 }}
 QTableWidget {{
     background: {PAL['surface']};
@@ -275,7 +284,7 @@ QLabel#step_title {{
     color: {PAL['text_pri']};
 }}
 QLabel#tag_green {{
-    background: #0f2b14;
+    background: #e6f4ea;
     border: 1px solid {PAL['green']};
     color: {PAL['green']};
     border-radius: 3px;
@@ -285,7 +294,7 @@ QLabel#tag_green {{
     font-weight: 700;
 }}
 QLabel#tag_amber {{
-    background: #2b1f06;
+    background: #fff3cd;
     border: 1px solid {PAL['amber']};
     color: {PAL['amber']};
     border-radius: 3px;
@@ -295,7 +304,7 @@ QLabel#tag_amber {{
     font-weight: 700;
 }}
 QLabel#tag_red {{
-    background: #2b0a0a;
+    background: #fce8e6;
     border: 1px solid {PAL['red']};
     color: {PAL['red']};
     border-radius: 3px;
@@ -325,6 +334,10 @@ QLabel#tag_cyan {{
     font-weight: 700;
 }}
 """
+
+AUTO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_config.json")
+
+MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch", "mirror_out", "mirror_tx", "mirror_ty", "mirror_tz"}
 
 # ─── Default config ───────────────────────────────────────────────────────────
 DEFAULT_PVS = {
@@ -522,7 +535,7 @@ class AlignmentWorker(QObject):
         self.log("  Scanning DCM roll → finding BPM x = 0 zero-crossing…")
         true_zero = random.uniform(-0.005, 0.005)
         xs_roll, ys_roll = sim_scan_roll_bpm(
-            p["roll_start"], p["roll_stop"], p["roll_steps"], true_zero
+            row["roll"] + p["roll_start"], row["roll"] + p["roll_stop"], p["roll_steps"], true_zero
         )
         for x, y in zip(xs_roll, ys_roll):
             if self._abort: return self._abort_cleanup()
@@ -775,7 +788,7 @@ class BeamPathWidget(QWidget):
                 text_col   = QColor(PAL["amber"])
             elif active:
                 border_col = QColor(PAL["green"])
-                fill_col   = QColor("#0f2b14")
+                fill_col   = QColor("#e6f4ea")
                 text_col   = QColor(PAL["green"])
             else:
                 border_col = QColor(PAL["border"])
@@ -849,32 +862,49 @@ class SetupTab(QWidget):
         lay.setSpacing(16)
         lay.setContentsMargins(16, 16, 16, 16)
 
-        # PV names
-        pv_box = QGroupBox("Motor & PV Names")
-        pv_lay = QGridLayout(pv_box)
-        pv_lay.setSpacing(8)
-        labels = {
-            "mono_energy":   "Mono Energy",
+        # PV names — left column has two stacked group boxes
+        pv_col = QVBoxLayout()
+
+        motor_labels = {
+            "mono_energy": "Mono Energy",
+            "roll":        "DCM Roll",
+            "pitch":       "DCM Pitch",
+            "mirror_out":  "Mirror Out",
+            "mirror_tx":   "Mirror TX",
+            "mirror_ty":   "Mirror TY",
+            "mirror_tz":   "Mirror TZ",
+        }
+        motor_box = QGroupBox("Motor PVs")
+        motor_lay = QGridLayout(motor_box)
+        motor_lay.setSpacing(8)
+        for row, (key, label) in enumerate(motor_labels.items()):
+            motor_lay.addWidget(QLabel(label), row, 0)
+            ed = QLineEdit(DEFAULT_PVS[key])
+            self._pv_fields[key] = ed
+            motor_lay.addWidget(ed, row, 1)
+
+        other_labels = {
             "und_energy":    "Undulator Energy",
-            "roll":          "DCM Roll",
-            "pitch":         "DCM Pitch",
             "piezo_pitch":   "DCM Piezo Pitch",
             "piezo_roll":    "DCM Piezo Roll",
             "bpm_x":         "BPM X readback",
             "bpm_y":         "BPM Y readback",
             "bpm_intensity": "BPM Intensity",
-            "mirror_out":    "Mirror Out",
-            "mirror_tx":     "Mirror TX",
-            "mirror_ty":     "Mirror TY",
-            "mirror_tz":     "Mirror TZ",
             "feedback_h":    "H Feedback PV",
             "feedback_v":    "V Feedback PV",
         }
-        for row, (key, label) in enumerate(labels.items()):
-            pv_lay.addWidget(QLabel(label), row, 0)
+        other_box = QGroupBox("Other PVs")
+        other_lay = QGridLayout(other_box)
+        other_lay.setSpacing(8)
+        for row, (key, label) in enumerate(other_labels.items()):
+            other_lay.addWidget(QLabel(label), row, 0)
             ed = QLineEdit(DEFAULT_PVS[key])
             self._pv_fields[key] = ed
-            pv_lay.addWidget(ed, row, 1)
+            other_lay.addWidget(ed, row, 1)
+
+        pv_col.addWidget(motor_box)
+        pv_col.addWidget(other_box)
+        pv_col.addStretch()
 
         # Right column
         right = QVBoxLayout()
@@ -925,8 +955,11 @@ class SetupTab(QWidget):
 
         btn_row = QHBoxLayout()
         test_btn = styled_button("Test EPICS Connection")
+        test_btn.clicked.connect(self._test_epics)
         load_btn = styled_button("Load Config…")
         save_btn = styled_button("Save Config…")
+        load_btn.clicked.connect(self._load_config)
+        save_btn.clicked.connect(self._save_config)
         btn_row.addWidget(test_btn)
         btn_row.addWidget(load_btn)
         btn_row.addWidget(save_btn)
@@ -944,13 +977,139 @@ class SetupTab(QWidget):
         right.addWidget(conn_box)
         right.addStretch()
 
-        lay.addWidget(pv_box, 2)
+        lay.addLayout(pv_col, 2)
         lay.addLayout(right, 1)
         scroll.setWidget(inner)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+
+    def _test_epics(self):
+        if not EPICS_AVAILABLE:
+            QMessageBox.warning(self, "Test EPICS Connection",
+                                "pyepics is not installed — cannot test connections.")
+            return
+        import epics
+        pvs = self.get_pvs()
+        timeout = 2.0
+        results = {}
+
+        def _check(key, pv_name):
+            if not pv_name.strip():
+                results[key] = (pv_name, "skipped")
+                return
+            try:
+                pv = epics.PV(pv_name, connection_timeout=timeout)
+                connected = pv.wait_for_connection(timeout=timeout)
+                if connected:
+                    pv.disconnect()
+                    results[key] = (pv_name, "ok")
+                elif key in MOTOR_PV_KEYS:
+                    rbv = epics.PV(pv_name + ".RBV", connection_timeout=timeout)
+                    connected_rbv = rbv.wait_for_connection(timeout=timeout)
+                    if connected_rbv:
+                        rbv.disconnect()
+                    results[key] = (pv_name, "ok (via .RBV)" if connected_rbv else "timeout")
+                else:
+                    results[key] = (pv_name, "timeout")
+            except Exception as e:
+                msg = str(e)
+                results[key] = (pv_name, "timeout" if "access violation" in msg.lower() else f"error: {msg}")
+
+        threads = [threading.Thread(target=_check, args=(k, v)) for k, v in pvs.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        labels = {
+            "mono_energy": "Mono Energy", "roll": "DCM Roll", "pitch": "DCM Pitch",
+            "mirror_out": "Mirror Out", "mirror_tx": "Mirror TX",
+            "mirror_ty": "Mirror TY", "mirror_tz": "Mirror TZ",
+            "und_energy": "Undulator Energy",
+            "piezo_pitch": "DCM Piezo Pitch", "piezo_roll": "DCM Piezo Roll",
+            "bpm_x": "BPM X", "bpm_y": "BPM Y", "bpm_intensity": "BPM Intensity",
+            "feedback_h": "H Feedback", "feedback_v": "V Feedback",
+        }
+        n_ok = sum(1 for _, (_, s) in results.items() if s == "ok")
+        n_total = sum(1 for _, (pv, s) in results.items() if s != "skipped")
+
+        rows = ""
+        for key, (pv_name, status) in results.items():
+            label = labels.get(key, key)
+            if status in ("ok", "ok (via .RBV)"):
+                icon, color = "✓", PAL["green"]
+            elif status == "skipped":
+                icon, color = "—", PAL["text_dim"]
+            else:
+                icon, color = "✗", PAL["red"]
+            rows += (
+                f'<tr>'
+                f'<td style="padding:3px 8px;color:{PAL["text_sec"]}">{label}</td>'
+                f'<td style="padding:3px 8px;font-family:monospace;color:{PAL["text_dim"]}">{pv_name or "(empty)"}</td>'
+                f'<td style="padding:3px 8px;color:{color};font-weight:600">{icon} {status}</td>'
+                f'</tr>'
+            )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("EPICS Connection Test")
+        dlg.setMinimumWidth(560)
+        layout = QVBoxLayout(dlg)
+        summary = QLabel(f"<b>{n_ok} / {n_total} PVs connected</b>")
+        summary.setStyleSheet(f"font-size:13px; color:{PAL['green'] if n_ok == n_total else PAL['amber']};")
+        layout.addWidget(summary)
+        text = QLabel(f'<table cellspacing="0">{rows}</table>')
+        text.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(text)
+        close_btn = styled_button("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
+
+    def _save_config(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Config", "dcm_config.json", "JSON files (*.json)")
+        if not path:
+            return
+        cfg = {
+            "pvs": self.get_pvs(),
+            "scan": self.get_scan_params(),
+            "simulate": self.is_simulate(),
+        }
+        try:
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, "Save Config", f"Could not write file:\n{e}")
+
+    def _apply_config(self, cfg):
+        for k, v in cfg.get("pvs", {}).items():
+            if k in self._pv_fields:
+                self._pv_fields[k].setText(str(v))
+        for k, v in cfg.get("scan", {}).items():
+            if k not in self._scan_fields:
+                continue
+            w = self._scan_fields[k]
+            if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                w.setValue(v)
+            elif isinstance(w, QComboBox):
+                idx = w.findText(str(v))
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+        if "simulate" in cfg:
+            self.sim_check.setChecked(bool(cfg["simulate"]))
+
+    def _load_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Config", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, "Load Config", f"Could not read file:\n{e}")
+            return
+        self._apply_config(cfg)
 
     def get_pvs(self):
         return {k: v.text() for k, v in self._pv_fields.items()}
@@ -1579,6 +1738,32 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("Ready")
+
+        self._auto_load_config()
+
+    def _auto_load_config(self):
+        if not os.path.exists(AUTO_CONFIG_PATH):
+            return
+        try:
+            with open(AUTO_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            self.setup_tab._apply_config(cfg)
+            self.status.showMessage(f"Config restored from {AUTO_CONFIG_PATH}")
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        cfg = {
+            "pvs": self.setup_tab.get_pvs(),
+            "scan": self.setup_tab.get_scan_params(),
+            "simulate": self.setup_tab.is_simulate(),
+        }
+        try:
+            with open(AUTO_CONFIG_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _start_alignment(self):
         pvs = self.setup_tab.get_pvs()
