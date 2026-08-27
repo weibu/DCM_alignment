@@ -337,7 +337,7 @@ QLabel#tag_cyan {{
 
 AUTO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_config.json")
 
-MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch", "mirror_out", "mirror_tx", "mirror_ty", "mirror_tz"}
+MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch"}
 
 # ─── Default config ───────────────────────────────────────────────────────────
 DEFAULT_PVS = {
@@ -350,20 +350,36 @@ DEFAULT_PVS = {
     "bpm_x":            "BPM:x:readback",
     "bpm_y":            "BPM:y:readback",
     "bpm_intensity":    "BPM:intensity:readback",
-    "mirror_out":       "Mirror:y:SP",
-    "mirror_tx":        "Mirror:tx:SP",
-    "mirror_ty":        "Mirror:ty:SP",
-    "mirror_tz":        "Mirror:tz:SP",
     "feedback_h":       "BPM:feedback:H:enable",
     "feedback_v":       "BPM:feedback:V:enable",
+    "und_harmonic":     "",
+    "und_start":        "",
 }
 
+def calc_harmonic(mono_e):
+    if mono_e < 13:
+        return 1
+    elif mono_e < 28:
+        return 3
+    return 5
+
 DEFAULT_LOOKUP = [
-    {"mono_e": 8.0,  "ue": 9.8,  "roll": 0.412, "pitch": 2.341},
-    {"mono_e": 10.0, "ue": 12.1, "roll": 0.398, "pitch": 2.187},
-    {"mono_e": 12.0, "ue": 14.6, "roll": 0.381, "pitch": 2.054},
-    {"mono_e": 15.0, "ue": 18.2, "roll": 0.362, "pitch": 1.893},
-    {"mono_e": 20.0, "ue": 24.1, "roll": 0.344, "pitch": 1.712},
+    {"mono_e": 8.0,  "ue": 9.8,  "roll": 0.412, "pitch": 2.341, "harmonic": 1},
+    {"mono_e": 10.0, "ue": 12.1, "roll": 0.398, "pitch": 2.187, "harmonic": 1},
+    {"mono_e": 12.0, "ue": 14.6, "roll": 0.381, "pitch": 2.054, "harmonic": 1},
+    {"mono_e": 15.0, "ue": 18.2, "roll": 0.362, "pitch": 1.893, "harmonic": 3},
+    {"mono_e": 20.0, "ue": 24.1, "roll": 0.344, "pitch": 1.712, "harmonic": 3},
+]
+
+DEFAULT_MIRROR_STAGES = [
+    {"name": "JJC Center",           "pv": "15IDC:Slit4VDcenter.VAL",  "val_in":  0.0,    "val_out": -2.0},
+    {"name": "JJC Size",             "pv": "15IDC:Slit4VDsize.VAL",    "val_in":  0.4,    "val_out":  4.0},
+    {"name": "CRL Y",                "pv": "15IDMini:m2",              "val_in":  2.0,    "val_out":  0.0},
+    {"name": "VFM Y",                "pv": "ID15A1:DMS:VFM:Y",         "val_in":  0.0,    "val_out": -3000.0},
+    {"name": "VDM Y",                "pv": "ID15A1:DMS:VDM:Y",         "val_in":  0.0,    "val_out":  3000.0},
+    {"name": "BPM Y",                "pv": "15IDC:m3",                 "val_in":  0.0,    "val_out": -2.0},
+    {"name": "BPM Scale Y",          "pv": "15IDA:userTran10.CLCI",    "val_in":  51.2,   "val_out":  512.0},
+    {"name": "Vertical Feedback P",  "pv": "15ID1:BeamPosY.KP",        "val_in":  0.0001, "val_out":  0.001},
 ]
 
 DEFAULT_SCAN = {
@@ -440,12 +456,14 @@ class AlignmentWorker(QObject):
     feedback_update  = pyqtSignal(bool, bool)          # h, v
     finished         = pyqtSignal(bool)                # success
 
-    def __init__(self, pvs, scan_params, row, simulate=True):
+    def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True, mirror_stages=None):
         super().__init__()
         self.pvs = pvs
         self.params = scan_params
         self.row = row
         self.simulate = simulate
+        self.skip_mirror = skip_mirror
+        self.mirror_stages = mirror_stages or []
         self._abort = False
         self.epics = EpicsInterface(simulate=simulate)
 
@@ -501,9 +519,22 @@ class AlignmentWorker(QObject):
         if not self._sleep(0.4): return self._abort_cleanup()
 
         self.log("  Moving motors to lookup table setpoints…")
+
+        # Undulator: set harmonic → set energy → trigger start
+        if pvs.get("und_harmonic"):
+            self.epics.put(pvs["und_harmonic"], row["harmonic"])
+            self.log(f"  [{pvs['und_harmonic']}] → {row['harmonic']}  (harmonic)", "ok")
+            if not self._sleep(0.15): return self._abort_cleanup()
+        self.epics.put(pvs["und_energy"], row["ue"])
+        self.log(f"  [{pvs['und_energy']}] → {row['ue']} keV  (undulator energy)", "ok")
+        if not self._sleep(0.15): return self._abort_cleanup()
+        if pvs.get("und_start"):
+            self.epics.put(pvs["und_start"], 1)
+            self.log(f"  [{pvs['und_start']}] → 1  (start undulator move)", "ok")
+            if not self._sleep(0.15): return self._abort_cleanup()
+
         for key, pv_key, unit in [
             ("mono_e", "mono_energy", "keV"),
-            ("ue",     "und_energy",  "keV"),
             ("roll",   "roll",        ""),
             ("pitch",  "pitch",       ""),
         ]:
@@ -512,10 +543,13 @@ class AlignmentWorker(QObject):
             if not self._sleep(0.15): return self._abort_cleanup()
 
         self.log("  Retracting mirror from beam path…")
-        for pv_key in ["mirror_tx", "mirror_ty", "mirror_tz"]:
-            self.epics.put(pvs[pv_key], 0.0)
-        if not self._sleep(0.6): return self._abort_cleanup()
-        self.log(f"  Mirror retracted.", "ok")
+        for stage in self.mirror_stages:
+            if stage["pv"].strip():
+                self.epics.put(stage["pv"], stage["val_out"])
+                self.log(f"  [{stage['pv']}] → {stage['val_out']}  ({stage['name']} OUT)", "ok")
+                if not self._sleep(0.1): return self._abort_cleanup()
+        if not self._sleep(0.4): return self._abort_cleanup()
+        self.log("  Mirror retracted.", "ok")
         self.step_status.emit(2, "done")
         self.log("Step 2 complete.", "ok")
 
@@ -573,13 +607,26 @@ class AlignmentWorker(QObject):
         self.step_status.emit(3, "done")
         self.log("Step 3 complete.", "ok")
 
-        # ── Step 4: Mirror alignment (placeholder) ─────────────────────
-        self.step_status.emit(4, "running")
-        self.log("━━ Step 4 — Mirror alignment ━━")
-        self.log("  [Placeholder] Mirror alignment substeps not yet defined.", "warn")
-        self.log("  Skipping — configure substeps in the Mirror tab.", "warn")
-        if not self._sleep(0.5): return self._abort_cleanup()
-        self.step_status.emit(4, "done")
+        # ── Step 4: Mirror alignment (optional) ───────────────────────
+        if self.skip_mirror:
+            self.step_status.emit(4, "done")
+            self.log("━━ Step 4 — Mirror alignment skipped ━━", "warn")
+            # Mirror was retracted in Step 2; move it back in now
+            self.log("  Moving mirror into beam path…")
+            for stage in self.mirror_stages:
+                if stage["pv"].strip():
+                    self.epics.put(stage["pv"], stage["val_in"])
+                    self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
+                    if not self._sleep(0.1): return self._abort_cleanup()
+            if not self._sleep(0.4): return self._abort_cleanup()
+            self.log("  Mirror in position.", "ok")
+        else:
+            self.step_status.emit(4, "running")
+            self.log("━━ Step 4 — Mirror alignment ━━")
+            self.log("  [Placeholder] Mirror alignment substeps not yet defined.", "warn")
+            self.log("  Skipping — configure substeps in the Mirror tab.", "warn")
+            if not self._sleep(0.5): return self._abort_cleanup()
+            self.step_status.emit(4, "done")
 
         # ── Step 5: Enable feedback loops ──────────────────────────────
         self.step_status.emit(5, "running")
@@ -747,12 +794,11 @@ class StepHeader(QWidget):
 # ─── Beam path widget ─────────────────────────────────────────────────────────
 class BeamPathWidget(QWidget):
     ELEMENTS = [
-        ("Source",    None),
-        ("Mirror",    4),
-        ("Xtal 1",    3),
-        ("Xtal 2",    3),
-        ("BPM",       5),
-        ("Sample",    None),
+        ("Source",  None),
+        ("Xtal",    3),
+        ("Mirror",  4),
+        ("BPM",     5),
+        ("Sample",  None),
     ]
 
     def __init__(self, parent=None):
@@ -847,6 +893,8 @@ class LogWidget(QTextEdit):
 
 # ─── Setup Tab ───────────────────────────────────────────────────────────────
 class SetupTab(QWidget):
+    changed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pv_fields = {}
@@ -858,9 +906,13 @@ class SetupTab(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         inner = QWidget()
-        lay = QHBoxLayout(inner)
+        inner_vlay = QVBoxLayout(inner)
+        inner_vlay.setSpacing(12)
+        inner_vlay.setContentsMargins(16, 16, 16, 16)
+        top_w = QWidget()
+        lay = QHBoxLayout(top_w)
         lay.setSpacing(16)
-        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setContentsMargins(0, 0, 0, 0)
 
         # PV names — left column has two stacked group boxes
         pv_col = QVBoxLayout()
@@ -869,10 +921,6 @@ class SetupTab(QWidget):
             "mono_energy": "Mono Energy",
             "roll":        "DCM Roll",
             "pitch":       "DCM Pitch",
-            "mirror_out":  "Mirror Out",
-            "mirror_tx":   "Mirror TX",
-            "mirror_ty":   "Mirror TY",
-            "mirror_tz":   "Mirror TZ",
         }
         motor_box = QGroupBox("Motor PVs")
         motor_lay = QGridLayout(motor_box)
@@ -892,6 +940,8 @@ class SetupTab(QWidget):
             "bpm_intensity": "BPM Intensity",
             "feedback_h":    "H Feedback PV",
             "feedback_v":    "V Feedback PV",
+            "und_harmonic":  "Undulator Harmonic PV",
+            "und_start":     "Undulator Start PV",
         }
         other_box = QGroupBox("Other PVs")
         other_lay = QGridLayout(other_box)
@@ -979,11 +1029,56 @@ class SetupTab(QWidget):
 
         lay.addLayout(pv_col, 2)
         lay.addLayout(right, 1)
+        inner_vlay.addWidget(top_w)
+
+        # Mirror Stages table (full width)
+        mirror_box = QGroupBox("Mirror Stages (In / Out Positions)")
+        mirror_box_lay = QVBoxLayout(mirror_box)
+        self._mirror_table = QTableWidget()
+        self._mirror_table.setColumnCount(4)
+        self._mirror_table.setHorizontalHeaderLabels(["Name", "PV", "Value (In)", "Value (Out)"])
+        self._mirror_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._mirror_table.setAlternatingRowColors(True)
+        self._mirror_stages = [dict(s) for s in DEFAULT_MIRROR_STAGES]
+        self._mirror_table.setRowCount(len(self._mirror_stages))
+        for r, stage in enumerate(self._mirror_stages):
+            for c, key in enumerate(["name", "pv", "val_in", "val_out"]):
+                self._mirror_table.setItem(r, c, QTableWidgetItem(str(stage[key])))
+        self._mirror_table.cellChanged.connect(self._on_mirror_cell_changed)
+        mirror_box_lay.addWidget(self._mirror_table)
+        inner_vlay.addWidget(mirror_box)
+
         scroll.setWidget(inner)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+
+        for ed in self._pv_fields.values():
+            ed.textChanged.connect(self.changed)
+        for w in self._scan_fields.values():
+            if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                w.valueChanged.connect(self.changed)
+            elif isinstance(w, QComboBox):
+                w.currentTextChanged.connect(self.changed)
+        self.sim_check.toggled.connect(self.changed)
+
+    def _on_mirror_cell_changed(self, r, c):
+        if r >= len(self._mirror_stages):
+            return
+        key = ["name", "pv", "val_in", "val_out"][c]
+        text = self._mirror_table.item(r, c).text()
+        if key in ("val_in", "val_out"):
+            try:
+                self._mirror_stages[r][key] = float(text)
+            except ValueError:
+                return
+        else:
+            self._mirror_stages[r][key] = text
+        self.changed.emit()
+
+    def get_mirror_stages(self):
+        return [dict(s) for s in self._mirror_stages]
 
     def _test_epics(self):
         if not EPICS_AVAILABLE:
@@ -1017,6 +1112,10 @@ class SetupTab(QWidget):
                 msg = str(e)
                 results[key] = (pv_name, "timeout" if "access violation" in msg.lower() else f"error: {msg}")
 
+        # Add mirror stage PVs (keyed as "mirror:N")
+        for i, stage in enumerate(self._mirror_stages):
+            pvs[f"mirror:{i}"] = stage["pv"]
+
         threads = [threading.Thread(target=_check, args=(k, v)) for k, v in pvs.items()]
         for t in threads:
             t.start()
@@ -1025,14 +1124,15 @@ class SetupTab(QWidget):
 
         labels = {
             "mono_energy": "Mono Energy", "roll": "DCM Roll", "pitch": "DCM Pitch",
-            "mirror_out": "Mirror Out", "mirror_tx": "Mirror TX",
-            "mirror_ty": "Mirror TY", "mirror_tz": "Mirror TZ",
             "und_energy": "Undulator Energy",
             "piezo_pitch": "DCM Piezo Pitch", "piezo_roll": "DCM Piezo Roll",
             "bpm_x": "BPM X", "bpm_y": "BPM Y", "bpm_intensity": "BPM Intensity",
             "feedback_h": "H Feedback", "feedback_v": "V Feedback",
+            "und_harmonic": "Und Harmonic", "und_start": "Und Start",
         }
-        n_ok = sum(1 for _, (_, s) in results.items() if s == "ok")
+        for i, stage in enumerate(self._mirror_stages):
+            labels[f"mirror:{i}"] = stage["name"]
+        n_ok = sum(1 for _, (_, s) in results.items() if s in ("ok", "ok (via .RBV)"))
         n_total = sum(1 for _, (pv, s) in results.items() if s != "skipped")
 
         rows = ""
@@ -1083,6 +1183,14 @@ class SetupTab(QWidget):
             QMessageBox.critical(self, "Save Config", f"Could not write file:\n{e}")
 
     def _apply_config(self, cfg):
+        if "mirror_stages" in cfg:
+            self._mirror_stages = [dict(s) for s in cfg["mirror_stages"]]
+            self._mirror_table.blockSignals(True)
+            self._mirror_table.setRowCount(len(self._mirror_stages))
+            for r, stage in enumerate(self._mirror_stages):
+                for c, key in enumerate(["name", "pv", "val_in", "val_out"]):
+                    self._mirror_table.setItem(r, c, QTableWidgetItem(str(stage[key])))
+            self._mirror_table.blockSignals(False)
         for k, v in cfg.get("pvs", {}).items():
             if k in self._pv_fields:
                 self._pv_fields[k].setText(str(v))
@@ -1130,6 +1238,7 @@ class SetupTab(QWidget):
 # ─── Energy Table Tab ─────────────────────────────────────────────────────────
 class EnergyTableTab(QWidget):
     row_selected = pyqtSignal(dict)
+    changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1158,12 +1267,13 @@ class EnergyTableTab(QWidget):
 
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Mono E (keV)", "Undulator E (keV)", "Roll", "Pitch"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Mono E (keV)", "Undulator E (keV)", "Harmonic", "Roll", "Pitch"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_select)
+        self.table.cellChanged.connect(self._on_cell_changed)
         lay.addWidget(self.table)
 
         add_btn.clicked.connect(self._add_row)
@@ -1173,15 +1283,29 @@ class EnergyTableTab(QWidget):
 
         self._refresh_table()
 
+    _COLS = ["mono_e", "ue", "harmonic", "roll", "pitch"]
+
     def _refresh_table(self):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self._data))
         for r, row in enumerate(self._data):
-            for c, key in enumerate(["mono_e", "ue", "roll", "pitch"]):
+            for c, key in enumerate(self._COLS):
                 item = QTableWidgetItem(str(row[key]))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
+
+    def _on_cell_changed(self, r, c):
+        if r >= len(self._data):
+            return
+        key = self._COLS[c]
+        text = self.table.item(r, c).text()
+        try:
+            val = int(text) if key == "harmonic" else float(text)
+            self._data[r][key] = val
+            self.changed.emit()
+        except ValueError:
+            pass
 
     def _on_select(self):
         rows = self.table.selectedItems()
@@ -1198,9 +1322,10 @@ class EnergyTableTab(QWidget):
         self.row_selected.emit(self._selected)
 
     def _add_row(self):
-        self._data.append({"mono_e": 0.0, "ue": 0.0, "roll": 0.0, "pitch": 0.0})
+        self._data.append({"mono_e": 0.0, "ue": 0.0, "harmonic": 1, "roll": 0.0, "pitch": 0.0})
         self._refresh_table()
         self.table.selectRow(len(self._data) - 1)
+        self.changed.emit()
 
     def _del_row(self):
         r = self.table.currentRow()
@@ -1208,6 +1333,7 @@ class EnergyTableTab(QWidget):
             return
         self._data.pop(r)
         self._refresh_table()
+        self.changed.emit()
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV files (*.csv)")
@@ -1218,27 +1344,37 @@ class EnergyTableTab(QWidget):
             self._data = []
             for row in reader:
                 try:
+                    mono_e = float(row.get("mono_e", 0))
                     self._data.append({
-                        "mono_e": float(row.get("mono_e", 0)),
-                        "ue":     float(row.get("ue", 0)),
-                        "roll":   float(row.get("roll", 0)),
-                        "pitch":  float(row.get("pitch", 0)),
+                        "mono_e":   mono_e,
+                        "ue":       float(row.get("ue", 0)),
+                        "harmonic": int(row["harmonic"]) if "harmonic" in row else calc_harmonic(mono_e),
+                        "roll":     float(row.get("roll", 0)),
+                        "pitch":    float(row.get("pitch", 0)),
                     })
                 except (ValueError, KeyError):
                     pass
         self._refresh_table()
+        self.changed.emit()
 
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "lookup_table.csv", "CSV files (*.csv)")
         if not path:
             return
         with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["mono_e", "ue", "roll", "pitch"])
+            writer = csv.DictWriter(f, fieldnames=["mono_e", "ue", "harmonic", "roll", "pitch"])
             writer.writeheader()
             writer.writerows(self._data)
 
     def selected_row(self):
         return self._selected
+
+    def get_table_data(self):
+        return [dict(r) for r in self._data]
+
+    def set_table_data(self, data):
+        self._data = [dict(r) for r in data]
+        self._refresh_table()
 
 
 # ─── Alignment Tab ────────────────────────────────────────────────────────────
@@ -1416,9 +1552,16 @@ class AlignmentTab(QWidget):
         # Step 4
         s4 = QGroupBox()
         s4l = QVBoxLayout(s4)
+        hdr4_row = QHBoxLayout()
         hdr4 = StepHeader(4, "Mirror Alignment")
         self._step_headers[4] = hdr4
-        s4l.addWidget(hdr4)
+        hdr4_row.addWidget(hdr4)
+        hdr4_row.addStretch()
+        self.skip_mirror_chk = QCheckBox("Skip this step")
+        self.skip_mirror_chk.setChecked(True)
+        self.skip_mirror_chk.setToolTip("When checked, Step 4 is bypassed during alignment")
+        hdr4_row.addWidget(self.skip_mirror_chk)
+        s4l.addLayout(hdr4_row)
         ph = QLabel("Mirror alignment substeps not yet defined. Configure them in the Mirror tab.")
         ph.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 12px; padding: 10px 0;")
         s4l.addWidget(ph)
@@ -1474,7 +1617,7 @@ class AlignmentTab(QWidget):
         for key in ["mono_e", "ue", "roll", "pitch"]:
             self._s1_vals[key].setText(str(row[key]))
 
-    def start_alignment(self, pvs=None, scan_params=None, simulate=True):
+    def start_alignment(self, pvs=None, scan_params=None, simulate=True, mirror_stages=None):
         if not self._selected_row:
             QMessageBox.warning(self, "No row selected", "Please select an energy row in the Energy Table tab first.")
             return
@@ -1482,13 +1625,17 @@ class AlignmentTab(QWidget):
             pvs = DEFAULT_PVS
         if scan_params is None:
             scan_params = DEFAULT_SCAN
+        if mirror_stages is None:
+            mirror_stages = DEFAULT_MIRROR_STAGES
 
         self._reset_ui()
         self.start_btn.setEnabled(False)
         self.abort_btn.setEnabled(True)
 
         self._thread = QThread()
-        self._worker = AlignmentWorker(pvs, scan_params, self._selected_row, simulate=simulate)
+        self._worker = AlignmentWorker(pvs, scan_params, self._selected_row, simulate=simulate,
+                                       skip_mirror=self.skip_mirror_chk.isChecked(),
+                                       mirror_stages=mirror_stages)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.log_signal.connect(self._on_log)
@@ -1741,6 +1888,9 @@ class MainWindow(QMainWindow):
 
         self._auto_load_config()
 
+        self.setup_tab.changed.connect(self._save_config)
+        self.energy_tab.changed.connect(self._save_config)
+
     def _auto_load_config(self):
         if not os.path.exists(AUTO_CONFIG_PATH):
             return
@@ -1748,28 +1898,37 @@ class MainWindow(QMainWindow):
             with open(AUTO_CONFIG_PATH) as f:
                 cfg = json.load(f)
             self.setup_tab._apply_config(cfg)
+            if "energy_table" in cfg:
+                self.energy_tab.set_table_data(cfg["energy_table"])
             self.status.showMessage(f"Config restored from {AUTO_CONFIG_PATH}")
-        except Exception:
-            pass
+        except Exception as e:
+            self.status.showMessage(f"Could not restore config: {e}")
 
-    def closeEvent(self, event):
+    def _save_config(self):
         cfg = {
             "pvs": self.setup_tab.get_pvs(),
             "scan": self.setup_tab.get_scan_params(),
             "simulate": self.setup_tab.is_simulate(),
+            "energy_table": self.energy_tab.get_table_data(),
+            "mirror_stages": self.setup_tab.get_mirror_stages(),
         }
         try:
             with open(AUTO_CONFIG_PATH, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
+
+    def closeEvent(self, event):
+        self._save_config()
         super().closeEvent(event)
 
     def _start_alignment(self):
         pvs = self.setup_tab.get_pvs()
         params = self.setup_tab.get_scan_params()
         simulate = self.setup_tab.is_simulate()
-        self.alignment_tab.start_alignment(pvs=pvs, scan_params=params, simulate=simulate)
+        mirror_stages = self.setup_tab.get_mirror_stages()
+        self.alignment_tab.start_alignment(pvs=pvs, scan_params=params, simulate=simulate,
+                                           mirror_stages=mirror_stages)
         self.tabs.setCurrentWidget(self.alignment_tab)
         self.status.showMessage("Alignment running…")
         self.alignment_tab._worker.finished.connect(
