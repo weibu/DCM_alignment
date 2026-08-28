@@ -156,7 +156,7 @@ QComboBox::drop-down {{
     border: none;
 }}
 QPushButton {{
-    background: transparent;
+    background: {PAL['bg']};
     border: 1px solid {PAL['border']};
     border-radius: 5px;
     padding: 6px 16px;
@@ -165,13 +165,14 @@ QPushButton {{
     font-size: 12px;
 }}
 QPushButton:hover {{
+    background: {PAL['bg']};
     border-color: {PAL['cyan']};
     color: {PAL['cyan']};
 }}
 QPushButton:disabled {{
-    opacity: 0.4;
-    color: {PAL['text_dim']};
-    border-color: {PAL['border']};
+    background: {PAL['surface']};
+    color: {PAL['border']};
+    border-color: {PAL['surface_hi']};
 }}
 QPushButton#primary {{
     background: {PAL['cyan']};
@@ -532,6 +533,10 @@ class AlignmentWorker(QObject):
         pvs = self.pvs
         row = self.row
         p   = self.params
+
+        # Emit initial BPM values so readouts are populated immediately
+        self.bpm_update.emit(0.0, 0.0, 0.0)
+        self.feedback_update.emit(False, False)
 
         # ── Step 1: Load settings ──────────────────────────────────────
         self.step_status.emit(1, "running")
