@@ -337,7 +337,7 @@ QLabel#tag_cyan {{
 
 AUTO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_config.json")
 
-MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch"}
+MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch", "mir_slit_top", "mir_slit_bot"}
 
 # ─── Default config ───────────────────────────────────────────────────────────
 DEFAULT_PVS = {
@@ -354,6 +354,10 @@ DEFAULT_PVS = {
     "feedback_v":       "BPM:feedback:V:enable",
     "und_harmonic":     "",
     "und_start":        "",
+    "mir_slit_top":     "15IDA:m9",
+    "mir_slit_bot":     "15IDA:m10",
+    "mir_piezo_pitch":  "",
+    "ion_chamber":      "",
 }
 
 def calc_harmonic(mono_e):
@@ -392,6 +396,19 @@ DEFAULT_SCAN = {
     "settle_time":  0.1,
     "peak_method":  "centroid",
     "piezo_center": 5.0,
+    # Mirror alignment scan params
+    "mir_signal":         "BPM Intensity",
+    "mir_slit_size_a":    0.1,
+    "mir_slit_cen_start": -2.0,
+    "mir_slit_cen_stop":  2.0,
+    "mir_slit_cen_steps": 21,
+    "mir_slit_size_b":    0.2,
+    "mir_vdm_start":      -500.0,
+    "mir_vdm_stop":        500.0,
+    "mir_vdm_steps":       21,
+    "mir_vfm_start":      -250.0,
+    "mir_vfm_stop":        250.0,
+    "mir_vfm_steps":       21,
 }
 
 # ─── Simulation helpers ───────────────────────────────────────────────────────
@@ -454,6 +471,7 @@ class AlignmentWorker(QObject):
     scan_peak        = pyqtSignal(str, float)          # (motor, peak_x)
     bpm_update       = pyqtSignal(float, float, float) # x, y, intensity
     feedback_update  = pyqtSignal(bool, bool)          # h, v
+    mir_substep      = pyqtSignal(str, str)            # (step_id "A"–"D", status)
     finished         = pyqtSignal(bool)                # success
 
     def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True, mirror_stages=None):
@@ -483,6 +501,23 @@ class AlignmentWorker(QObject):
 
     def log(self, msg, level="info"):
         self.log_signal.emit(msg, level)
+
+    def _wait_motor_done(self, motor_pv, timeout=30.0):
+        if self.simulate:
+            return self._sleep(0.05)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._abort:
+                return False
+            try:
+                dmov = self.epics.get(motor_pv + ".DMOV")
+                if dmov:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.05)
+        self.log(f"  Warning: motor {motor_pv} did not finish in {timeout}s", "warn")
+        return True
 
     def run(self):
         try:
@@ -623,10 +658,176 @@ class AlignmentWorker(QObject):
         else:
             self.step_status.emit(4, "running")
             self.log("━━ Step 4 — Mirror alignment ━━")
-            self.log("  [Placeholder] Mirror alignment substeps not yet defined.", "warn")
-            self.log("  Skipping — configure substeps in the Mirror tab.", "warn")
+
+            top_pv  = pvs.get("mir_slit_top", "")
+            bot_pv  = pvs.get("mir_slit_bot", "")
+            mir_piezo_pv = pvs.get("mir_piezo_pitch", "")
+            signal_key   = p.get("mir_signal", "BPM Intensity")
+            signal_pv    = pvs["bpm_intensity"] if signal_key == "BPM Intensity" else pvs.get("ion_chamber", pvs["bpm_intensity"])
+
+            # Resolve VFM/VDM PVs from mirror stages table
+            vdm_pv = "ID15A1:DMS:VDM:Y"
+            vfm_pv = "ID15A1:DMS:VFM:Y"
+            for stage in self.mirror_stages:
+                nm = stage.get("name", "")
+                if "VDM" in nm:
+                    vdm_pv = stage["pv"]
+                elif "VFM" in nm:
+                    vfm_pv = stage["pv"]
+
+            slit_size_a    = p.get("mir_slit_size_a", 0.1)
+            slit_cen_start = p.get("mir_slit_cen_start", -2.0)
+            slit_cen_stop  = p.get("mir_slit_cen_stop", 2.0)
+            slit_cen_steps = int(p.get("mir_slit_cen_steps", 21))
+            slit_size_b    = p.get("mir_slit_size_b", 0.2)
+            vdm_start      = p.get("mir_vdm_start", -500.0)
+            vdm_stop       = p.get("mir_vdm_stop", 500.0)
+            vdm_steps      = int(p.get("mir_vdm_steps", 21))
+            vfm_start      = p.get("mir_vfm_start", -250.0)
+            vfm_stop       = p.get("mir_vfm_stop", 250.0)
+            vfm_steps      = int(p.get("mir_vfm_steps", 21))
+
+            # ── 4A: Slit scan (mirror out) → find beam center ─────────
+            self.mir_substep.emit("A", "running")
+            self.log("  4A: Slit center scan — mirror out, finding beam center…")
+            slit_peak = 0.0
+            if top_pv and bot_pv:
+                cur_top = self.epics.get(top_pv) or 0.0
+                cur_bot = self.epics.get(bot_pv) or 0.0
+                cur_cen = (cur_top + cur_bot) / 2.0
+                self.log(f"  Closing slit to {slit_size_a} mm (center ≈ {cur_cen:.3f})")
+                self.epics.put(top_pv, cur_cen + slit_size_a / 2.0)
+                self.epics.put(bot_pv, cur_cen - slit_size_a / 2.0)
+                if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+
+                xs_slit = np.linspace(cur_cen + slit_cen_start, cur_cen + slit_cen_stop, slit_cen_steps)
+                ys_slit = []
+                _true_cen = cur_cen + random.uniform(-0.3, 0.3)
+                for cen in xs_slit:
+                    if self._abort: return self._abort_cleanup()
+                    self.epics.put(top_pv, cen + slit_size_a / 2.0)
+                    self.epics.put(bot_pv, cen - slit_size_a / 2.0)
+                    if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                    if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+                    sig = (gaussian(cen, _true_cen, 0.5, 1000.0, 10.0) + random.uniform(-5, 5)
+                           if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                    ys_slit.append(sig)
+                    self.scan_point.emit("mir_slit_cen", float(cen), float(sig))
+                    if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+
+                slit_peak = find_peak_centroid(xs_slit, np.array(ys_slit))
+                self.scan_peak.emit("mir_slit_cen", slit_peak)
+                self.log(f"  Beam center at {slit_peak:.4f} mm → moving slit", "ok")
+                self.epics.put(top_pv, slit_peak + slit_size_a / 2.0)
+                self.epics.put(bot_pv, slit_peak - slit_size_a / 2.0)
+                if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+            else:
+                self.log("  Slit PVs not configured — skipping 4A slit scan.", "warn")
+            self.mir_substep.emit("A", "done")
+
+            # ── 4B: Mirror in → close slit → pitch piezo → BPMY = 0 ──
+            self.mir_substep.emit("B", "running")
+            self.log("  4B: Moving mirror into beam path…")
+            for stage in self.mirror_stages:
+                if stage["pv"].strip():
+                    self.epics.put(stage["pv"], stage["val_in"])
+                    self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
+                    if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.5): return self._abort_cleanup()
+            self.log("  Mirror in position.", "ok")
+
+            if top_pv and bot_pv:
+                self.log(f"  Narrowing slit to {slit_size_b} mm for mirror scan")
+                self.epics.put(top_pv, slit_peak + slit_size_b / 2.0)
+                self.epics.put(bot_pv, slit_peak - slit_size_b / 2.0)
+                if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+
+            if mir_piezo_pv:
+                self.log("  Scanning mirror pitch piezo → BPMY = 0…")
+                piezo_cur = self.epics.get(mir_piezo_pv) or p.get("piezo_center", 5.0)
+                xs_piezo = np.linspace(piezo_cur - 1.0, piezo_cur + 1.0, 21)
+                ys_bpmy = []
+                _piezo_zero = piezo_cur + random.uniform(-0.1, 0.1)
+                for px in xs_piezo:
+                    if self._abort: return self._abort_cleanup()
+                    self.epics.put(mir_piezo_pv, px)
+                    if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+                    bpmy = (-(px - _piezo_zero) * 0.5 + random.uniform(-0.002, 0.002)
+                            if self.simulate else (self.epics.get(pvs["bpm_y"]) or 0.0))
+                    ys_bpmy.append(bpmy)
+                    self.scan_point.emit("mir_piezo", float(px), float(bpmy))
+                    self.bpm_update.emit(0.0, float(bpmy), 0.5)
+
+                piezo_zero = find_zero_crossing(xs_piezo, np.array(ys_bpmy))
+                self.scan_peak.emit("mir_piezo", piezo_zero)
+                self.epics.put(mir_piezo_pv, piezo_zero)
+                self.log(f"  BPMY zero-crossing at piezo = {piezo_zero:.5f} → moved", "ok")
+            else:
+                self.log("  Mirror piezo pitch PV not configured — skipping BPMY centering.", "warn")
+            self.mir_substep.emit("B", "done")
+
+            # ── 4C: Scan VDM:Y → find peak → move ────────────────────
+            self.mir_substep.emit("C", "running")
+            self.log("  4C: Scanning VDM:Y → finding signal peak…")
+            vdm_cur = self.epics.get(vdm_pv) or 0.0
+            xs_vdm = np.linspace(vdm_cur + vdm_start, vdm_cur + vdm_stop, vdm_steps)
+            ys_vdm = []
+            _vdm_true = vdm_cur + random.uniform(-50, 50)
+            for vdm_pos in xs_vdm:
+                if self._abort: return self._abort_cleanup()
+                self.epics.put(vdm_pv, vdm_pos)
+                if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
+                sig = (gaussian(vdm_pos, _vdm_true, 150.0, 1000.0, 10.0) + random.uniform(-5, 5)
+                       if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                ys_vdm.append(sig)
+                self.scan_point.emit("mir_vdm", float(vdm_pos), float(sig))
+                if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+
+            vdm_peak = find_peak_centroid(xs_vdm, np.array(ys_vdm))
+            self.scan_peak.emit("mir_vdm", vdm_peak)
+            self.epics.put(vdm_pv, vdm_peak)
+            if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
+            self.log(f"  VDM:Y peak at {vdm_peak:.2f} → moved", "ok")
+            self.mir_substep.emit("C", "done")
+
+            # ── 4D: Coupled VFM+VDM scan (VDM step = 2× VFM step) ────
+            self.mir_substep.emit("D", "running")
+            self.log("  4D: Coupled VFM:Y + VDM:Y scan (VDM step = 2× VFM step)…")
+            vfm_cur  = self.epics.get(vfm_pv) or 0.0
+            vdm_ref  = self.epics.get(vdm_pv) or vdm_peak
+            xs_vfm   = np.linspace(vfm_cur + vfm_start, vfm_cur + vfm_stop, vfm_steps)
+            ys_coupled = []
+            _vfm_true = vfm_cur + random.uniform(-30, 30)
+            for vfm_pos in xs_vfm:
+                if self._abort: return self._abort_cleanup()
+                vfm_delta = vfm_pos - vfm_cur
+                vdm_pos   = vdm_ref + 2.0 * vfm_delta
+                self.epics.put(vfm_pv, vfm_pos)
+                self.epics.put(vdm_pv, vdm_pos)
+                if not self._wait_motor_done(vfm_pv): return self._abort_cleanup()
+                if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
+                sig = (gaussian(vfm_pos, _vfm_true, 80.0, 1000.0, 10.0) + random.uniform(-5, 5)
+                       if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                ys_coupled.append(sig)
+                self.scan_point.emit("mir_coupled", float(vfm_pos), float(sig))
+                if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+
+            vfm_peak_pos    = find_peak_centroid(xs_vfm, np.array(ys_coupled))
+            vfm_delta_final = vfm_peak_pos - vfm_cur
+            vdm_final       = vdm_ref + 2.0 * vfm_delta_final
+            self.scan_peak.emit("mir_coupled", vfm_peak_pos)
+            self.epics.put(vfm_pv, vfm_peak_pos)
+            if not self._wait_motor_done(vfm_pv): return self._abort_cleanup()
+            self.epics.put(vdm_pv, vdm_final)
+            if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
+            self.log(f"  VFM:Y → {vfm_peak_pos:.2f}  VDM:Y → {vdm_final:.2f}  (2× delta applied)", "ok")
+            self.mir_substep.emit("D", "done")
+
             self.step_status.emit(4, "done")
+            self.log("Step 4 complete.", "ok")
 
         # ── Step 5: Enable feedback loops ──────────────────────────────
         self.step_status.emit(5, "running")
@@ -918,9 +1119,11 @@ class SetupTab(QWidget):
         pv_col = QVBoxLayout()
 
         motor_labels = {
-            "mono_energy": "Mono Energy",
-            "roll":        "DCM Roll",
-            "pitch":       "DCM Pitch",
+            "mono_energy":   "Mono Energy",
+            "roll":          "DCM Roll",
+            "pitch":         "DCM Pitch",
+            "mir_slit_top":  "Mirror Slit Top",
+            "mir_slit_bot":  "Mirror Slit Bottom",
         }
         motor_box = QGroupBox("Motor PVs")
         motor_lay = QGridLayout(motor_box)
@@ -932,16 +1135,18 @@ class SetupTab(QWidget):
             motor_lay.addWidget(ed, row, 1)
 
         other_labels = {
-            "und_energy":    "Undulator Energy",
-            "piezo_pitch":   "DCM Piezo Pitch",
-            "piezo_roll":    "DCM Piezo Roll",
-            "bpm_x":         "BPM X readback",
-            "bpm_y":         "BPM Y readback",
-            "bpm_intensity": "BPM Intensity",
-            "feedback_h":    "H Feedback PV",
-            "feedback_v":    "V Feedback PV",
-            "und_harmonic":  "Undulator Harmonic PV",
-            "und_start":     "Undulator Start PV",
+            "und_energy":      "Undulator Energy",
+            "piezo_pitch":     "DCM Piezo Pitch",
+            "piezo_roll":      "DCM Piezo Roll",
+            "bpm_x":           "BPM X readback",
+            "bpm_y":           "BPM Y readback",
+            "bpm_intensity":   "BPM Intensity",
+            "feedback_h":      "H Feedback PV",
+            "feedback_v":      "V Feedback PV",
+            "und_harmonic":    "Undulator Harmonic PV",
+            "und_start":       "Undulator Start PV",
+            "mir_piezo_pitch": "Mirror Piezo Pitch",
+            "ion_chamber":     "Ion Chamber",
         }
         other_box = QGroupBox("Other PVs")
         other_lay = QGridLayout(other_box)
@@ -1023,7 +1228,47 @@ class SetupTab(QWidget):
         epics_note.setStyleSheet(f"color: {PAL['green'] if EPICS_AVAILABLE else PAL['amber']}; font-size: 11px;")
         conn_lay.addWidget(epics_note)
 
+        mir_scan_box = QGroupBox("Mirror Scan Parameters")
+        mir_scan_lay = QGridLayout(mir_scan_box)
+        mir_scan_lay.setSpacing(8)
+
+        # Signal selector
+        mir_scan_lay.addWidget(QLabel("Signal source"), 0, 0)
+        mir_sig_cb = QComboBox()
+        mir_sig_cb.addItems(["BPM Intensity", "Ion Chamber"])
+        self._scan_fields["mir_signal"] = mir_sig_cb
+        mir_scan_lay.addWidget(mir_sig_cb, 0, 1)
+
+        mir_scan_defs = [
+            ("mir_slit_size_a",    "Slit size 4A (mm)",       QDoubleSpinBox,  0.01, 5.0,   0.1,   3),
+            ("mir_slit_cen_start", "Slit scan start (mm)",    QDoubleSpinBox, -20.0, 0.0,  -2.0,   2),
+            ("mir_slit_cen_stop",  "Slit scan stop (mm)",     QDoubleSpinBox,  0.0, 20.0,   2.0,   2),
+            ("mir_slit_cen_steps", "Slit scan steps",         QSpinBox,        3,  200,    21,    0),
+            ("mir_slit_size_b",    "Slit size 4B (mm)",       QDoubleSpinBox,  0.01, 5.0,   0.2,   3),
+            ("mir_vdm_start",      "VDM scan start (offset)", QDoubleSpinBox, -5000.0, 0.0, -500.0, 1),
+            ("mir_vdm_stop",       "VDM scan stop (offset)",  QDoubleSpinBox,  0.0, 5000.0, 500.0,  1),
+            ("mir_vdm_steps",      "VDM scan steps",          QSpinBox,        3,  200,    21,    0),
+            ("mir_vfm_start",      "VFM scan start (offset)", QDoubleSpinBox, -5000.0, 0.0, -250.0, 1),
+            ("mir_vfm_stop",       "VFM scan stop (offset)",  QDoubleSpinBox,  0.0, 5000.0, 250.0,  1),
+            ("mir_vfm_steps",      "VFM scan steps",          QSpinBox,        3,  200,    21,    0),
+        ]
+        for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(mir_scan_defs, start=1):
+            mir_scan_lay.addWidget(QLabel(lbl), r, 0)
+            if cls == QDoubleSpinBox:
+                sb = QDoubleSpinBox()
+                sb.setDecimals(dec)
+                sb.setRange(mn, mx)
+                sb.setValue(dflt)
+            else:
+                sb = QSpinBox()
+                sb.setRange(mn, mx)
+                sb.setValue(dflt)
+            sb.setMinimumWidth(100)
+            self._scan_fields[key] = sb
+            mir_scan_lay.addWidget(sb, r, 1)
+
         right.addWidget(scan_box)
+        right.addWidget(mir_scan_box)
         right.addWidget(conn_box)
         right.addStretch()
 
@@ -1124,11 +1369,13 @@ class SetupTab(QWidget):
 
         labels = {
             "mono_energy": "Mono Energy", "roll": "DCM Roll", "pitch": "DCM Pitch",
+            "mir_slit_top": "Mirror Slit Top", "mir_slit_bot": "Mirror Slit Bottom",
             "und_energy": "Undulator Energy",
             "piezo_pitch": "DCM Piezo Pitch", "piezo_roll": "DCM Piezo Roll",
             "bpm_x": "BPM X", "bpm_y": "BPM Y", "bpm_intensity": "BPM Intensity",
             "feedback_h": "H Feedback", "feedback_v": "V Feedback",
             "und_harmonic": "Und Harmonic", "und_start": "Und Start",
+            "mir_piezo_pitch": "Mirror Piezo Pitch", "ion_chamber": "Ion Chamber",
         }
         for i, stage in enumerate(self._mirror_stages):
             labels[f"mirror:{i}"] = stage["name"]
@@ -1559,12 +1806,58 @@ class AlignmentTab(QWidget):
         hdr4_row.addStretch()
         self.skip_mirror_chk = QCheckBox("Skip this step")
         self.skip_mirror_chk.setChecked(True)
-        self.skip_mirror_chk.setToolTip("When checked, Step 4 is bypassed during alignment")
+        self.skip_mirror_chk.setToolTip("When checked, Step 4 is bypassed; mirror is inserted before Step 5")
         hdr4_row.addWidget(self.skip_mirror_chk)
         s4l.addLayout(hdr4_row)
-        ph = QLabel("Mirror alignment substeps not yet defined. Configure them in the Mirror tab.")
-        ph.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 12px; padding: 10px 0;")
-        s4l.addWidget(ph)
+
+        s4_inner = QHBoxLayout()
+
+        # Substep checklist
+        s4_check_w = QWidget()
+        s4_check_l = QVBoxLayout(s4_check_w)
+        s4_check_l.setSpacing(6)
+        self._s4_checks = []
+        for txt in [
+            "4A: Slit scan → beam center",
+            "4B: Mirror in + piezo → BPMY = 0",
+            "4C: Scan VDM:Y → peak",
+            "4D: Coupled VFM+VDM → peak",
+        ]:
+            lbl = QLabel(f"○  {txt}")
+            lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 12px;")
+            self._s4_checks.append(lbl)
+            s4_check_l.addWidget(lbl)
+        s4_check_l.addStretch()
+        s4_inner.addWidget(s4_check_w, 1)
+
+        # Slit scan plot (4A)
+        self.mir_slit_plot = make_plot("Slit Scan (4A)", "Signal", "Slit center (mm)")
+        self.mir_slit_plot.setMinimumHeight(150)
+        self.mir_slit_curve   = self.mir_slit_plot.plot([], [], pen=pg.mkPen(PAL["cyan"], width=2))
+        self.mir_slit_scatter = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(PAL["cyan"]))
+        self.mir_slit_plot.addItem(self.mir_slit_scatter)
+        self.mir_slit_peak_line = pg.InfiniteLine(angle=90, pen=pg.mkPen(PAL["amber"], width=1.5,
+                                                                          style=Qt.PenStyle.DashLine))
+        self.mir_slit_plot.addItem(self.mir_slit_peak_line)
+        self.mir_slit_peak_line.setVisible(False)
+        self._mir_slit_xs, self._mir_slit_ys = [], []
+        s4_inner.addWidget(self.mir_slit_plot, 2)
+
+        # VDM / coupled scan plot (4C and 4D, reused)
+        self.mir_vdm_plot = make_plot("Mirror Motor Scan (4C / 4D)", "Signal", "Motor position")
+        self.mir_vdm_plot.setMinimumHeight(150)
+        self.mir_vdm_curve   = self.mir_vdm_plot.plot([], [], pen=pg.mkPen(PAL["cyan"], width=2),
+                                                        fillLevel=0, brush=pg.mkBrush(PAL["cyan_dim"] + "88"))
+        self.mir_vdm_scatter = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(PAL["cyan"]))
+        self.mir_vdm_plot.addItem(self.mir_vdm_scatter)
+        self.mir_vdm_peak_line = pg.InfiniteLine(angle=90, pen=pg.mkPen(PAL["amber"], width=1.5,
+                                                                          style=Qt.PenStyle.DashLine))
+        self.mir_vdm_plot.addItem(self.mir_vdm_peak_line)
+        self.mir_vdm_peak_line.setVisible(False)
+        self._mir_vdm_xs, self._mir_vdm_ys = [], []
+        s4_inner.addWidget(self.mir_vdm_plot, 2)
+
+        s4l.addLayout(s4_inner)
         steps_l.addWidget(s4)
 
         # Step 5
@@ -1644,6 +1937,7 @@ class AlignmentTab(QWidget):
         self._worker.scan_peak.connect(self._on_scan_peak)
         self._worker.bpm_update.connect(self._on_bpm_update)
         self._worker.feedback_update.connect(self._on_feedback)
+        self._worker.mir_substep.connect(self._on_mir_substep)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
@@ -1685,13 +1979,38 @@ class AlignmentTab(QWidget):
         tag.style().unpolish(tag)
         tag.style().polish(tag)
 
+    def _on_mir_substep(self, step_id, status):
+        idx = {"A": 0, "B": 1, "C": 2, "D": 3}.get(step_id, -1)
+        if idx < 0:
+            return
+        labels = [
+            "4A: Slit scan → beam center",
+            "4B: Mirror in + piezo → BPMY = 0",
+            "4C: Scan VDM:Y → peak",
+            "4D: Coupled VFM+VDM → peak",
+        ]
+        lbl = self._s4_checks[idx]
+        if status == "running":
+            lbl.setText(f"⟳  {labels[idx]}")
+            lbl.setStyleSheet(f"color: {PAL['amber']}")
+            # Clear VDM plot when starting 4D so it shows fresh coupled scan data
+            if step_id == "D":
+                self._mir_vdm_xs.clear(); self._mir_vdm_ys.clear()
+                self.mir_vdm_curve.setData([], [])
+                self.mir_vdm_scatter.setData([], [])
+                self.mir_vdm_peak_line.setVisible(False)
+                self.mir_vdm_plot.setTitle("Coupled VFM+VDM Scan (4D)",
+                                           color=PAL["text_sec"], size="11pt")
+        elif status == "done":
+            lbl.setText(f"✓  {labels[idx]}")
+            lbl.setStyleSheet(f"color: {PAL['green']}")
+
     def _on_scan_point(self, motor, x, y):
         if motor == "roll":
             self._roll_xs.append(x)
             self._roll_ys.append(y)
             self.roll_curve.setData(self._roll_xs, self._roll_ys)
             self.roll_scatter.setData(self._roll_xs, self._roll_ys)
-            # update substep
             if len(self._roll_xs) == 1:
                 self._s3_checks[2].setText("⟳  Scan roll → BPM x = 0")
                 self._s3_checks[2].setStyleSheet(f"color: {PAL['amber']}")
@@ -1703,6 +2022,16 @@ class AlignmentTab(QWidget):
             if len(self._pitch_xs) == 1:
                 self._s3_checks[3].setText("⟳  Scan pitch → intensity peak")
                 self._s3_checks[3].setStyleSheet(f"color: {PAL['amber']}")
+        elif motor == "mir_slit_cen":
+            self._mir_slit_xs.append(x)
+            self._mir_slit_ys.append(y)
+            self.mir_slit_curve.setData(self._mir_slit_xs, self._mir_slit_ys)
+            self.mir_slit_scatter.setData(self._mir_slit_xs, self._mir_slit_ys)
+        elif motor in ("mir_vdm", "mir_coupled", "mir_piezo"):
+            self._mir_vdm_xs.append(x)
+            self._mir_vdm_ys.append(y)
+            self.mir_vdm_curve.setData(self._mir_vdm_xs, self._mir_vdm_ys)
+            self.mir_vdm_scatter.setData(self._mir_vdm_xs, self._mir_vdm_ys)
 
     def _on_scan_peak(self, motor, peak):
         if motor == "roll":
@@ -1715,6 +2044,12 @@ class AlignmentTab(QWidget):
             self.pitch_peak_line.setVisible(True)
             self._s3_checks[3].setText(f"✓  Scan pitch → peak ({peak:.5f})")
             self._s3_checks[3].setStyleSheet(f"color: {PAL['green']}")
+        elif motor == "mir_slit_cen":
+            self.mir_slit_peak_line.setValue(peak)
+            self.mir_slit_peak_line.setVisible(True)
+        elif motor in ("mir_vdm", "mir_coupled", "mir_piezo"):
+            self.mir_vdm_peak_line.setValue(peak)
+            self.mir_vdm_peak_line.setVisible(True)
 
     def _on_bpm_update(self, x, y, intensity):
         self._bpm_x_lbl.setText(f"{x:+.4f}")
@@ -1763,13 +2098,31 @@ class AlignmentTab(QWidget):
         self.progress.setValue(0)
         self._roll_xs.clear(); self._roll_ys.clear()
         self._pitch_xs.clear(); self._pitch_ys.clear()
+        self._mir_slit_xs.clear(); self._mir_slit_ys.clear()
+        self._mir_vdm_xs.clear(); self._mir_vdm_ys.clear()
         self.roll_curve.setData([], [])
         self.roll_scatter.setData([], [])
         self.pitch_curve.setData([], [])
         self.pitch_scatter.setData([], [])
+        self.mir_slit_curve.setData([], [])
+        self.mir_slit_scatter.setData([], [])
+        self.mir_vdm_curve.setData([], [])
+        self.mir_vdm_scatter.setData([], [])
         self.roll_peak_line.setVisible(False)
         self.pitch_peak_line.setVisible(False)
+        self.mir_slit_peak_line.setVisible(False)
+        self.mir_vdm_peak_line.setVisible(False)
+        self.mir_vdm_plot.setTitle("Mirror Motor Scan (4C / 4D)", color=PAL["text_sec"], size="11pt")
         for chk in self._s3_checks:
+            chk.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 12px;")
+        s4_labels = [
+            "4A: Slit scan → beam center",
+            "4B: Mirror in + piezo → BPMY = 0",
+            "4C: Scan VDM:Y → peak",
+            "4D: Coupled VFM+VDM → peak",
+        ]
+        for chk, lbl in zip(self._s4_checks, s4_labels):
+            chk.setText(f"○  {lbl}")
             chk.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 12px;")
         for key in self._s5_rows:
             self._set_tag(self._s5_rows[key], "—", "grey")
@@ -1782,39 +2135,82 @@ class AlignmentTab(QWidget):
 class MirrorTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._readouts = {}
         self._build()
 
     def _build(self):
-        lay = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
 
         hdr = StepHeader(4, "Mirror Alignment")
         lay.addWidget(hdr)
 
-        ph_box = QGroupBox()
-        ph_l = QVBoxLayout(ph_box)
-        ph_lbl = QLabel(
-            "Mirror alignment substeps not yet defined.\n\n"
-            "Provide the procedure (motors to move, scan axes, signals to optimise) "
-            "and this tab will be built out with the same step-by-step cards, "
-            "live scan plots, and motor readbacks as the main Alignment tab."
+        # ── Procedure summary ──
+        proc_box = QGroupBox("Procedure Overview")
+        proc_l = QVBoxLayout(proc_box)
+        steps_txt = (
+            "<b>4A — Slit scan (mirror out):</b> Close upstream slit to a narrow vertical gap, "
+            "scan the slit center, and move to the signal peak to centre the beam.<br><br>"
+            "<b>4B — Mirror in, BPMY centering:</b> Insert the mirror, narrow the slit further, "
+            "then scan the mirror pitch piezo to find where BPM Y = 0.<br><br>"
+            "<b>4C — VDM:Y scan:</b> Scan the Vertical Deflecting Mirror height, move to the "
+            "signal peak.<br><br>"
+            "<b>4D — Coupled VFM+VDM scan:</b> Scan VFM:Y while VDM:Y follows with twice the "
+            "step size. Move VFM:Y to the peak; move VDM:Y by 2× the VFM delta."
         )
-        ph_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 13px; padding: 20px;")
-        ph_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ph_lbl.setWordWrap(True)
-        ph_l.addWidget(ph_lbl)
-        lay.addWidget(ph_box)
+        proc_lbl = QLabel(steps_txt)
+        proc_lbl.setWordWrap(True)
+        proc_lbl.setStyleSheet(f"color: {PAL['text_sec']}; font-size: 12px; padding: 4px;")
+        proc_lbl.setTextFormat(Qt.TextFormat.RichText)
+        proc_l.addWidget(proc_lbl)
+        lay.addWidget(proc_box)
 
-        # Placeholder motor readouts
-        motor_box = QGroupBox("Mirror Motor Readbacks (Placeholder)")
-        m_lay = QHBoxLayout(motor_box)
-        for label in ["Mirror TX", "Mirror TY", "Mirror TZ"]:
-            w, _ = make_readout(label, "—", "mm")
-            m_lay.addWidget(w)
-        m_lay.addStretch()
-        lay.addWidget(motor_box)
+        # ── Motor readbacks ──
+        rb_box = QGroupBox("Mirror Motor Readbacks")
+        rb_lay = QHBoxLayout(rb_box)
+        rb_lay.setSpacing(20)
+        for key, label, unit in [
+            ("vfm_y",    "VFM:Y",      "µm"),
+            ("vdm_y",    "VDM:Y",      "µm"),
+            ("slit_top", "Slit Top",   "mm"),
+            ("slit_bot", "Slit Bottom","mm"),
+        ]:
+            w, val = make_readout(label, "—", unit)
+            self._readouts[key] = val
+            rb_lay.addWidget(w)
+            rb_lay.addWidget(make_separator())
+        rb_lay.addStretch()
+        lay.addWidget(rb_box)
+
+        # ── Config reference ──
+        cfg_box = QGroupBox("Scan Parameters Reference")
+        cfg_l = QVBoxLayout(cfg_box)
+        cfg_lbl = QLabel(
+            "Mirror scan parameters (slit sizes, scan ranges, signal source) are configured "
+            "in the <b>Setup</b> tab under <i>Mirror Scan Parameters</i>.<br>"
+            "Slit motor PVs and the mirror piezo pitch PV are under "
+            "<i>Motor PVs</i> / <i>Other PVs</i>."
+        )
+        cfg_lbl.setWordWrap(True)
+        cfg_lbl.setTextFormat(Qt.TextFormat.RichText)
+        cfg_lbl.setStyleSheet(f"color: {PAL['text_sec']}; font-size: 12px; padding: 4px;")
+        cfg_l.addWidget(cfg_lbl)
+        lay.addWidget(cfg_box)
+
         lay.addStretch()
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def update_readback(self, key, value):
+        if key in self._readouts:
+            self._readouts[key].setText(f"{value:.3f}")
 
 
 # ─── Main Window ─────────────────────────────────────────────────────────────
