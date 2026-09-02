@@ -433,6 +433,7 @@ DEFAULT_RECORD_PVS = [
     # ── Computed during alignment sequence ──
     {"label": "BPM Max Intensity w/o Mirror",   "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "MonP Max Intensity w/o Mirror",  "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "Mirror Stripe",                  "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "BPM Y @ 5B (µm)",                 "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "VDM Y FWHM @ 4D (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "VFM Y FWHM @ 4E (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
@@ -494,6 +495,23 @@ DEFAULT_MIRROR_SCAN = {
     "mir_vfm_steps":       21,
     "mir_slit_size_c":    2.0,
 }
+
+# ─── Mirror stripe selection ─────────────────────────────────────────────────
+_STRIPE_VFM_X_PV = "ID15A1:DMS:VFM:X"
+_STRIPE_VDM_X_PV = "ID15A1:DMS:VDM:X"
+_STRIPE_POSITIONS = {
+    "Si": {"vfm_x":      0, "vdm_x":      0},
+    "Rh": {"vfm_x":  13000, "vdm_x": -13000},
+    "Pt": {"vfm_x": -13000, "vdm_x":  13000},
+}
+
+def select_stripe(energy_kev):
+    if energy_kev <= 12:
+        return "Si"
+    elif energy_kev <= 23:
+        return "Rh"
+    else:
+        return "Pt"
 
 # ─── Simulation helpers ───────────────────────────────────────────────────────
 def gaussian(x, center, sigma, amp, offset=0.0):
@@ -607,6 +625,7 @@ class AlignmentWorker(QObject):
     finished         = pyqtSignal(bool)                # success
     confirm_needed   = pyqtSignal(str)                 # substep key, waiting for operator
     scan_results_ready = pyqtSignal(dict)              # fit results keyed by label
+    stripe_status      = pyqtSignal(str)               # "Si"/"Rh"/"Pt"/"changing"
 
     def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True,
                  mirror_stages=None, confirm_mode=False):
@@ -1068,7 +1087,7 @@ class AlignmentWorker(QObject):
             if not self.request_confirm("4_4A"): return self._abort_cleanup()
             self.substep_status.emit("4_4A", "done")
 
-            # ── 4B: Mirror in ─────────────────────────────────────────
+            # ── 4B: Mirror in + stripe selection ──────────────────────
             self.substep_status.emit("4_4B", "running")
             self.log("  4B: Moving mirror into beam path…")
             for stage in self.mirror_stages:
@@ -1078,6 +1097,8 @@ class AlignmentWorker(QObject):
                     if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.5): return self._abort_cleanup()
             self.log("  Mirror in position.", "ok")
+            if not self._apply_mirror_stripe(float(self.row.get("mono_e", 0))):
+                return self._abort_cleanup()
             self.substep_status.emit("4_4B", "done")
 
             # ── 4C: Close slit → pitch piezo → BPMY = 0 ──────────────
@@ -1210,6 +1231,8 @@ class AlignmentWorker(QObject):
                     if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.4): return self._abort_cleanup()
             self.log("  Mirror in position.", "ok")
+            if not self._apply_mirror_stripe(float(self.row.get("mono_e", 0))):
+                return self._abort_cleanup()
             self.substep_status.emit("5_5mir", "done")
 
         self.substep_status.emit("5_5a", "running")
@@ -1304,6 +1327,36 @@ class AlignmentWorker(QObject):
         self.log("━━ Alignment sequence finished successfully ━━", "ok")
         self.scan_results_ready.emit(dict(self._scan_results))
         self.finished.emit(True)
+
+    def _apply_mirror_stripe(self, energy_kev):
+        """Select mirror stripe based on energy. Checks RBV first; skips move if already within tolerance."""
+        stripe = select_stripe(energy_kev)
+        pos = _STRIPE_POSITIONS[stripe]
+        vfm_rbv_pv = _STRIPE_VFM_X_PV + ".RBV"
+        vdm_rbv_pv = _STRIPE_VDM_X_PV + ".RBV"
+        if self.simulate:
+            vfm_cur = self.epics.get(_STRIPE_VFM_X_PV)
+            vdm_cur = self.epics.get(_STRIPE_VDM_X_PV)
+        else:
+            vfm_cur = self.epics.get(vfm_rbv_pv)
+            vdm_cur = self.epics.get(vdm_rbv_pv)
+        vfm_cur = vfm_cur or 0.0
+        vdm_cur = vdm_cur or 0.0
+        if abs(vfm_cur - pos["vfm_x"]) <= 10 and abs(vdm_cur - pos["vdm_x"]) <= 10:
+            self.log(f"  Already on {stripe} stripe — no move needed", "ok")
+            self.stripe_status.emit(stripe)
+            self._scan_results["Mirror Stripe"] = stripe
+            return True
+        self.log(f"  Selecting mirror stripe: {stripe} (energy {energy_kev} keV)")
+        self.stripe_status.emit("changing")
+        self.epics.put(_STRIPE_VFM_X_PV, pos["vfm_x"])
+        self.epics.put(_STRIPE_VDM_X_PV, pos["vdm_x"])
+        if not self._wait_motor_done(_STRIPE_VFM_X_PV): return False
+        if not self._wait_motor_done(_STRIPE_VDM_X_PV): return False
+        self.log(f"  VFM:X → {pos['vfm_x']}  VDM:X → {pos['vdm_x']}  ({stripe} stripe)", "ok")
+        self.stripe_status.emit(stripe)
+        self._scan_results["Mirror Stripe"] = stripe
+        return True
 
     def _abort_cleanup(self):
         self.log("Alignment aborted by user.", "error")
@@ -2292,6 +2345,48 @@ class EnergyTableTab(QWidget):
         self._refresh_lookup_table()
 
 
+# ─── Mirror stripe indicator ──────────────────────────────────────────────────
+class MirrorStripeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(6)
+        lbl = QLabel("Mirror Stripe:")
+        lbl.setStyleSheet(f"color: {PAL['text_sec']}; font-size: 11px;")
+        lay.addWidget(lbl)
+        self._btns = {}
+        for stripe in ("Si", "Rh", "Pt"):
+            b = QLabel(stripe)
+            b.setFixedSize(38, 22)
+            b.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            b.setStyleSheet(self._off_style())
+            self._btns[stripe] = b
+            lay.addWidget(b)
+        self._changing = QLabel("Changing…")
+        self._changing.setStyleSheet(f"color: {PAL['amber']}; font-size: 11px; font-style: italic;")
+        self._changing.setVisible(False)
+        lay.addWidget(self._changing)
+        lay.addStretch()
+
+    def _off_style(self):
+        return (f"background: {PAL['surface']}; border: 1px solid {PAL['border']};"
+                f" border-radius: 3px; color: {PAL['text_dim']}; font-size: 11px;")
+
+    def _on_style(self):
+        return (f"background: {PAL['green']}; border: 1px solid {PAL['green']};"
+                f" border-radius: 3px; color: white; font-size: 11px; font-weight: 700;")
+
+    def set_stripe(self, stripe):
+        if stripe == "changing":
+            for b in self._btns.values():
+                b.setStyleSheet(self._off_style())
+            self._changing.setVisible(True)
+        else:
+            self._changing.setVisible(False)
+            for name, b in self._btns.items():
+                b.setStyleSheet(self._on_style() if name == stripe else self._off_style())
+
 # ─── Motor → scan plot mapping ────────────────────────────────────────────────
 # Plot A: position/zero-crossing scans. Plot B: intensity peak scans.
 _SCAN_PLOT_A = {
@@ -2338,6 +2433,7 @@ class AlignmentTab(QWidget):
         self._last_scan_results = {}
         self._build()
         self._on_skip_mirror_changed()
+        QTimer.singleShot(800, self._refresh_stripe_display)
 
     @staticmethod
     def _badge_style(color):
@@ -2517,6 +2613,9 @@ class AlignmentTab(QWidget):
         bpm_l.addStretch()
         right_lay.addWidget(bpm_w)
 
+        self._stripe_widget = MirrorStripeWidget()
+        right_lay.addWidget(self._stripe_widget)
+
         # Scan plots (always visible, updated per scan type)
         plot_w = QWidget()
         plot_lay = QHBoxLayout(plot_w)
@@ -2595,6 +2694,31 @@ class AlignmentTab(QWidget):
         lbl = self._substep_labels.get("5_5mir")
         if lbl:
             lbl.setVisible(skip)
+
+    def _refresh_stripe_display(self):
+        if not EPICS_AVAILABLE:
+            return
+        import concurrent.futures
+        def _read():
+            try:
+                import epics as _epics
+                vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0)
+                vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0)
+                if vfm is None or vdm is None:
+                    return None
+                for stripe, pos in _STRIPE_POSITIONS.items():
+                    if abs(vfm - pos["vfm_x"]) <= 10 and abs(vdm - pos["vdm_x"]) <= 10:
+                        return stripe
+            except Exception:
+                pass
+            return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_read)
+            while not fut.done():
+                QApplication.processEvents()
+            stripe = fut.result()
+        if stripe:
+            self._stripe_widget.set_stripe(stripe)
 
     def _set_substep(self, key, status, detail=""):
         lbl = self._substep_labels.get(key)
@@ -2724,6 +2848,7 @@ class AlignmentTab(QWidget):
         self._worker.substep_status.connect(self._set_substep)
         self._worker.confirm_needed.connect(self._on_confirm_needed)
         self._worker.scan_results_ready.connect(self._on_scan_results)
+        self._worker.stripe_status.connect(self._stripe_widget.set_stripe)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
@@ -3208,6 +3333,23 @@ class RecordTab(QWidget):
         def test_one(entry):
             label, pv = entry["label"], entry["pv"]
             if entry.get("source") == "scan_result":
+                if label == "Mirror Stripe":
+                    if simulate:
+                        return (label, "—", "sim")
+                    if not EPICS_AVAILABLE:
+                        return (label, "—", "no EPICS")
+                    try:
+                        import epics as _epics
+                        vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0)
+                        vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0)
+                        if vfm is None or vdm is None:
+                            return (label, "—", "✗  timeout")
+                        for s, pos in _STRIPE_POSITIONS.items():
+                            if abs(vfm - pos["vfm_x"]) <= 10 and abs(vdm - pos["vdm_x"]) <= 10:
+                                return (label, "—", f"✓  {s}")
+                        return (label, "—", f"✗  unknown  (VFM:X={vfm:.0f}  VDM:X={vdm:.0f})")
+                    except Exception as exc:
+                        return (label, "—", f"✗  {exc}")
                 return (label, "—", "— (computed after alignment)")
             if not pv:
                 return (label, "—", "— (no PV)")
