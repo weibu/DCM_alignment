@@ -23,6 +23,8 @@ import os
 import random
 import math
 import threading
+import concurrent.futures
+from datetime import datetime
 import codecs
 from pathlib import Path
 
@@ -60,39 +62,58 @@ try:
 except ImportError:
     EPICS_AVAILABLE = False
 
-# ─── Colour palette ──────────────────────────────────────────────────────────
-PAL = {
-    "bg":          "#f5f7fa",
-    "surface":     "#eaeef2",
-    "surface_hi":  "#dde2e8",
-    "border":      "#c8d0d8",
-    "cyan":        "#0a7a82",
-    "cyan_dim":    "#c8eef0",
-    "green":       "#1a7f37",
-    "amber":       "#9a6700",
-    "red":         "#cf2218",
-    "text_pri":    "#1f2328",
-    "text_sec":    "#57606a",
-    "text_dim":    "#6e7781",
+# ─── Colour palettes ─────────────────────────────────────────────────────────
+THEMES = {
+    "Ocean Light": {
+        "bg": "#f5f7fa", "surface": "#eaeef2", "surface_hi": "#dde2e8",
+        "border": "#c8d0d8", "cyan": "#0a7a82", "cyan_dim": "#c8eef0",
+        "green": "#1a7f37", "amber": "#9a6700", "red": "#cf2218",
+        "text_pri": "#1f2328", "text_sec": "#57606a", "text_dim": "#6e7781",
+        "tag_green_bg": "#e6f4ea", "tag_amber_bg": "#fff3cd", "tag_red_bg": "#fce8e6",
+    },
+    "Midnight": {
+        "bg": "#0d1117", "surface": "#161b22", "surface_hi": "#21262d",
+        "border": "#30363d", "cyan": "#2dd4d9", "cyan_dim": "#0c2e30",
+        "green": "#3fb950", "amber": "#e3b341", "red": "#f85149",
+        "text_pri": "#e6edf3", "text_sec": "#8b949e", "text_dim": "#6e7781",
+        "tag_green_bg": "#1a3224", "tag_amber_bg": "#2d2008", "tag_red_bg": "#2d1618",
+    },
+    "Slate Blue": {
+        "bg": "#f1f5f9", "surface": "#e2e8f0", "surface_hi": "#cbd5e1",
+        "border": "#94a3b8", "cyan": "#2563eb", "cyan_dim": "#dbeafe",
+        "green": "#16a34a", "amber": "#d97706", "red": "#dc2626",
+        "text_pri": "#0f172a", "text_sec": "#334155", "text_dim": "#64748b",
+        "tag_green_bg": "#dcfce7", "tag_amber_bg": "#fef3c7", "tag_red_bg": "#fee2e2",
+    },
+    "Carbon": {
+        "bg": "#1c1c1e", "surface": "#2c2c2e", "surface_hi": "#3a3a3c",
+        "border": "#48484a", "cyan": "#f5c542", "cyan_dim": "#3a2d00",
+        "green": "#30d158", "amber": "#ff9f0a", "red": "#ff453a",
+        "text_pri": "#f2f2f7", "text_sec": "#aeaeb2", "text_dim": "#636366",
+        "tag_green_bg": "#1a3824", "tag_amber_bg": "#3a2800", "tag_red_bg": "#380c0a",
+    },
 }
+PAL = dict(THEMES["Ocean Light"])
 
-QSS = f"""
+
+def build_qss(pal):
+    return f"""
 QMainWindow, QDialog {{
-    background: {PAL['bg']};
+    background: {pal['bg']};
 }}
 QWidget {{
-    background: {PAL['bg']};
-    color: {PAL['text_pri']};
+    background: {pal['bg']};
+    color: {pal['text_pri']};
     font-family: 'Inter', 'Segoe UI', sans-serif;
     font-size: 12px;
 }}
 QTabWidget::pane {{
-    border: 1px solid {PAL['border']};
-    background: {PAL['surface']};
+    border: 1px solid {pal['border']};
+    background: {pal['surface']};
 }}
 QTabBar::tab {{
-    background: {PAL['surface']};
-    color: {PAL['text_sec']};
+    background: {pal['surface']};
+    color: {pal['text_sec']};
     padding: 8px 20px;
     border: none;
     border-bottom: 2px solid transparent;
@@ -100,18 +121,18 @@ QTabBar::tab {{
     font-size: 12px;
 }}
 QTabBar::tab:selected {{
-    color: {PAL['cyan']};
-    border-bottom: 2px solid {PAL['cyan']};
-    background: {PAL['surface']};
+    color: {pal['cyan']};
+    border-bottom: 2px solid {pal['cyan']};
+    background: {pal['surface']};
 }}
 QGroupBox {{
-    border: 1px solid {PAL['border']};
+    border: 1px solid {pal['border']};
     border-radius: 6px;
     margin-top: 12px;
     padding: 12px;
-    background: {PAL['surface']};
+    background: {pal['surface']};
     font-weight: 600;
-    color: {PAL['text_sec']};
+    color: {pal['text_sec']};
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -122,172 +143,176 @@ QGroupBox::title {{
     padding: 0 4px;
 }}
 QLineEdit {{
-    background: {PAL['bg']};
-    border: 1px solid {PAL['border']};
+    background: {pal['bg']};
+    border: 1px solid {pal['border']};
     border-radius: 4px;
     padding: 5px 8px;
-    color: {PAL['cyan']};
+    color: {pal['cyan']};
     font-family: 'JetBrains Mono', 'Consolas', monospace;
     font-size: 11px;
-    selection-background-color: {PAL['cyan_dim']};
+    selection-background-color: {pal['cyan_dim']};
 }}
 QLineEdit:focus {{
-    border: 1px solid {PAL['cyan']};
+    border: 1px solid {pal['cyan']};
 }}
 QDoubleSpinBox, QSpinBox {{
-    background: {PAL['bg']};
-    border: 1px solid {PAL['border']};
+    background: {pal['bg']};
+    border: 1px solid {pal['border']};
     border-radius: 4px;
     padding: 4px 8px;
-    color: {PAL['cyan']};
+    color: {pal['cyan']};
     font-family: 'JetBrains Mono', 'Consolas', monospace;
 }}
 QDoubleSpinBox:focus, QSpinBox:focus {{
-    border: 1px solid {PAL['cyan']};
+    border: 1px solid {pal['cyan']};
 }}
 QComboBox {{
-    background: {PAL['bg']};
-    border: 1px solid {PAL['border']};
+    background: {pal['bg']};
+    border: 1px solid {pal['border']};
     border-radius: 4px;
     padding: 4px 8px;
-    color: {PAL['text_pri']};
+    color: {pal['text_pri']};
 }}
 QComboBox::drop-down {{
     border: none;
 }}
 QPushButton {{
-    background: {PAL['bg']};
-    border: 1px solid {PAL['border']};
+    background: {pal['bg']};
+    border: 1px solid {pal['border']};
     border-radius: 5px;
     padding: 6px 16px;
-    color: {PAL['text_sec']};
+    color: {pal['text_sec']};
     font-weight: 600;
     font-size: 12px;
 }}
 QPushButton:hover {{
-    background: {PAL['bg']};
-    border-color: {PAL['cyan']};
-    color: {PAL['cyan']};
+    background: {pal['bg']};
+    border-color: {pal['cyan']};
+    color: {pal['cyan']};
 }}
 QPushButton:disabled {{
-    background: {PAL['surface']};
-    color: {PAL['border']};
-    border-color: {PAL['surface_hi']};
+    background: {pal['surface']};
+    color: {pal['border']};
+    border-color: {pal['surface_hi']};
 }}
 QPushButton#primary {{
-    background: {PAL['cyan']};
-    color: {PAL['bg']};
-    border: none;
+    background: {pal['cyan_dim']};
+    color: {pal['text_pri']};
+    border: 2px solid {pal['cyan']};
     padding: 7px 20px;
+    font-size: 13px;
+    font-weight: 700;
 }}
 QPushButton#primary:hover {{
-    background: #09686f;
-    color: {PAL['bg']};
+    background: {pal['cyan']};
+    color: {pal['text_pri']};
+    border-color: {pal['cyan']};
 }}
 QPushButton#primary:disabled {{
-    background: {PAL['cyan_dim']};
-    color: {PAL['text_dim']};
+    background: {pal['surface_hi']};
+    color: {pal['text_dim']};
+    border-color: {pal['border']};
 }}
 QPushButton#danger {{
-    border-color: {PAL['red']};
-    color: {PAL['red']};
+    border-color: {pal['red']};
+    color: {pal['red']};
 }}
 QPushButton#danger:hover {{
-    background: #fce8e6;
+    background: {pal['tag_red_bg']};
 }}
 QTableWidget {{
-    background: {PAL['surface']};
-    alternate-background-color: {PAL['surface_hi']};
-    border: 1px solid {PAL['border']};
+    background: {pal['surface']};
+    alternate-background-color: {pal['surface_hi']};
+    border: 1px solid {pal['border']};
     border-radius: 4px;
-    gridline-color: {PAL['border']};
-    selection-background-color: {PAL['cyan_dim']};
-    selection-color: {PAL['cyan']};
+    gridline-color: {pal['border']};
+    selection-background-color: {pal['cyan_dim']};
+    selection-color: {pal['cyan']};
     font-family: 'JetBrains Mono', 'Consolas', monospace;
     font-size: 12px;
 }}
 QHeaderView::section {{
-    background: {PAL['surface_hi']};
-    color: {PAL['text_dim']};
+    background: {pal['surface_hi']};
+    color: {pal['text_dim']};
     padding: 6px 10px;
     border: none;
-    border-bottom: 1px solid {PAL['border']};
+    border-bottom: 1px solid {pal['border']};
     font-weight: 600;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
 }}
 QTextEdit {{
-    background: {PAL['bg']};
-    border: 1px solid {PAL['border']};
+    background: {pal['bg']};
+    border: 1px solid {pal['border']};
     border-radius: 4px;
-    color: {PAL['text_sec']};
+    color: {pal['text_sec']};
     font-family: 'JetBrains Mono', 'Consolas', monospace;
     font-size: 11px;
     padding: 6px;
 }}
 QScrollBar:vertical {{
-    background: {PAL['bg']};
+    background: {pal['bg']};
     width: 8px;
     border: none;
 }}
 QScrollBar::handle:vertical {{
-    background: {PAL['border']};
+    background: {pal['border']};
     border-radius: 4px;
     min-height: 20px;
 }}
 QCheckBox {{
-    color: {PAL['text_sec']};
+    color: {pal['text_sec']};
     spacing: 8px;
 }}
 QCheckBox::indicator {{
     width: 14px; height: 14px;
-    border: 1px solid {PAL['border']};
+    border: 1px solid {pal['border']};
     border-radius: 3px;
-    background: {PAL['bg']};
+    background: {pal['bg']};
 }}
 QCheckBox::indicator:checked {{
-    background: {PAL['cyan']};
-    border-color: {PAL['cyan']};
+    background: {pal['cyan']};
+    border-color: {pal['cyan']};
 }}
 QProgressBar {{
-    background: {PAL['surface_hi']};
-    border: 1px solid {PAL['border']};
+    background: {pal['surface_hi']};
+    border: 1px solid {pal['border']};
     border-radius: 3px;
     height: 6px;
     text-align: center;
 }}
 QProgressBar::chunk {{
-    background: {PAL['cyan']};
+    background: {pal['cyan']};
     border-radius: 3px;
 }}
 QStatusBar {{
-    background: {PAL['surface']};
-    color: {PAL['text_dim']};
+    background: {pal['surface']};
+    color: {pal['text_dim']};
     font-size: 11px;
-    border-top: 1px solid {PAL['border']};
+    border-top: 1px solid {pal['border']};
 }}
 QLabel#readout_value {{
     font-family: 'JetBrains Mono', 'Consolas', monospace;
     font-size: 20px;
     font-weight: 700;
-    color: {PAL['cyan']};
+    color: {pal['cyan']};
 }}
 QLabel#readout_label {{
     font-size: 10px;
-    color: {PAL['text_dim']};
+    color: {pal['text_dim']};
     letter-spacing: 1px;
     text-transform: uppercase;
 }}
 QLabel#step_title {{
     font-size: 13px;
     font-weight: 600;
-    color: {PAL['text_pri']};
+    color: {pal['text_pri']};
 }}
 QLabel#tag_green {{
-    background: #e6f4ea;
-    border: 1px solid {PAL['green']};
-    color: {PAL['green']};
+    background: {pal['tag_green_bg']};
+    border: 1px solid {pal['green']};
+    color: {pal['green']};
     border-radius: 3px;
     padding: 2px 8px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -295,9 +320,9 @@ QLabel#tag_green {{
     font-weight: 700;
 }}
 QLabel#tag_amber {{
-    background: #fff3cd;
-    border: 1px solid {PAL['amber']};
-    color: {PAL['amber']};
+    background: {pal['tag_amber_bg']};
+    border: 1px solid {pal['amber']};
+    color: {pal['amber']};
     border-radius: 3px;
     padding: 2px 8px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -305,9 +330,9 @@ QLabel#tag_amber {{
     font-weight: 700;
 }}
 QLabel#tag_red {{
-    background: #fce8e6;
-    border: 1px solid {PAL['red']};
-    color: {PAL['red']};
+    background: {pal['tag_red_bg']};
+    border: 1px solid {pal['red']};
+    color: {pal['red']};
     border-radius: 3px;
     padding: 2px 8px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -315,9 +340,9 @@ QLabel#tag_red {{
     font-weight: 700;
 }}
 QLabel#tag_grey {{
-    background: {PAL['surface_hi']};
-    border: 1px solid {PAL['border']};
-    color: {PAL['text_dim']};
+    background: {pal['surface_hi']};
+    border: 1px solid {pal['border']};
+    color: {pal['text_dim']};
     border-radius: 3px;
     padding: 2px 8px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -325,9 +350,9 @@ QLabel#tag_grey {{
     font-weight: 700;
 }}
 QLabel#tag_cyan {{
-    background: {PAL['cyan_dim']};
-    border: 1px solid {PAL['cyan']};
-    color: {PAL['cyan']};
+    background: {pal['cyan_dim']};
+    border: 1px solid {pal['cyan']};
+    color: {pal['cyan']};
     border-radius: 3px;
     padding: 2px 8px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -335,6 +360,9 @@ QLabel#tag_cyan {{
     font-weight: 700;
 }}
 """
+
+
+QSS = build_qss(PAL)
 
 AUTO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcm_config.json")
 
@@ -359,6 +387,11 @@ DEFAULT_PVS = {
     "mir_slit_bot":     "15IDA:m10",
     "mir_piezo_pitch":  "",
     "ion_chamber":      "",
+    "mir_slit_center":  "",
+    "mir_slit_size":    "",
+    "bpm_sen":          "15ID:FX4_1:Range",
+    "ic_sen_unit":      "15IDC:A2sens_unit.VAL",
+    "ic_sen_num":       "15IDC:A2sens_num.VAL",
 }
 
 def calc_harmonic(mono_e):
@@ -369,11 +402,48 @@ def calc_harmonic(mono_e):
     return 5
 
 DEFAULT_LOOKUP = [
-    {"mono_e": 8.0,  "ue": 9.8,  "roll": 0.412, "pitch": 2.341, "harmonic": 1},
-    {"mono_e": 10.0, "ue": 12.1, "roll": 0.398, "pitch": 2.187, "harmonic": 1},
-    {"mono_e": 12.0, "ue": 14.6, "roll": 0.381, "pitch": 2.054, "harmonic": 1},
-    {"mono_e": 15.0, "ue": 18.2, "roll": 0.362, "pitch": 1.893, "harmonic": 3},
-    {"mono_e": 20.0, "ue": 24.1, "roll": 0.344, "pitch": 1.712, "harmonic": 3},
+    {"mono_e": 8.0,  "ue": 9.8,  "roll": 0.412, "pitch": 2.341, "harmonic": 1, "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"},
+    {"mono_e": 10.0, "ue": 12.1, "roll": 0.398, "pitch": 2.187, "harmonic": 1, "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"},
+    {"mono_e": 12.0, "ue": 14.6, "roll": 0.381, "pitch": 2.054, "harmonic": 1, "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"},
+    {"mono_e": 15.0, "ue": 18.2, "roll": 0.362, "pitch": 1.893, "harmonic": 3, "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"},
+    {"mono_e": 20.0, "ue": 24.1, "roll": 0.344, "pitch": 1.712, "harmonic": 3, "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"},
+]
+
+DEFAULT_RECORD_PVS = [
+    # ── Core motor / beam settings ──
+    {"label": "Mono Energy (keV)",              "pv": "ID15A1:DCMM:XTAL:E.RBV",                   "checked": True,  "locked": True},
+    {"label": "XTAL",                           "pv": "ID15A1:DCMM:BLMODE:ACS:RET_RBV",            "checked": True,  "locked": True},
+    {"label": "Undulator Energy (keV)",         "pv": "S15ID:USID:EnergyM.VAL",                    "checked": True,  "locked": True},
+    {"label": "Undulator Gap (mm)",             "pv": "S15ID:USID:GapM.VAL",                       "checked": True,  "locked": True},
+    {"label": "Undulator Harmonic",             "pv": "S15ID:USID:HarmonicValueC",                 "checked": True,  "locked": True},
+    {"label": "Ring Current (mA)",              "pv": "S-DCCT:CurrentM",                           "checked": True,  "locked": True},
+    {"label": "DCM Pitch Motor (µrad)",         "pv": "ID15A1:DCMM:XTAL:PI2.RBV",                 "checked": True,  "locked": True},
+    {"label": "DCM Pitch Encoder",              "pv": "ID15A1:DCMM:XTAL:FIPI2",                    "checked": True,  "locked": True},
+    {"label": "DCM Roll Motor (µrad)",          "pv": "ID15A1:DCMM:XTAL:RO2.RBV",                 "checked": True,  "locked": True},
+    {"label": "DCM Roll Encoder",               "pv": "ID15A1:DCMM:XTAL:FIRO2.RBV",               "checked": True,  "locked": True},
+    {"label": "Mirror Slit Center (mm)",        "pv": "15IDA:MirVt2.D",                            "checked": True,  "locked": True},
+    {"label": "Mirror Angle (µrad)",            "pv": "ID15A1:DMS:VFM:PI.RBV",                     "checked": True,  "locked": True},
+    {"label": "Mirror 1st Y (µm)",              "pv": "ID15A1:DMS:VFM:PI.RBV",                     "checked": True,  "locked": True},
+    {"label": "Mirror 2nd Y (µm)",              "pv": "ID15A1:DMS:VDM:PI.RBV",                     "checked": True,  "locked": True},
+    {"label": "BPM Max Intensity",              "pv": "15IDC:userTran10.E",                        "checked": True,  "locked": True},
+    {"label": "BPM Sensitivity",                "pv": "15ID:FX4_1:Range_RBV",                      "checked": True,  "locked": True},
+    {"label": "MonP Max Intensity",             "pv": "15IDC:scaler1.S3",                          "checked": True,  "locked": True},
+    {"label": "MonP Sensitivity Unit",          "pv": "15IDC:A2sens_unit.VAL",                     "checked": True,  "locked": True},
+    {"label": "MonP Sensitivity Num",           "pv": "15IDC:A2sens_num.VAL",                      "checked": True,  "locked": True},
+    # ── Computed during alignment sequence ──
+    {"label": "BPM Max Intensity w/o Mirror",   "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "MonP Max Intensity w/o Mirror",  "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "BPM Y @ 5B (µm)",                 "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "VDM Y FWHM @ 4D (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "VFM Y FWHM @ 4E (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    # ── Optional / unchecked by default ──
+    {"label": "2nd Xtal Temp (°C)",             "pv": "15ID:BLEPS:TEMP23_CURRENT",                 "checked": False, "locked": True},
+    {"label": "RF BPM Vertical (µrad)",         "pv": "S15:ID:SrcPt:VAngleM",                      "checked": False, "locked": True},
+    {"label": "RF BPM Horizontal (µrad)",       "pv": "S15:ID:SrcPt:HAngleM",                      "checked": False, "locked": True},
+    {"label": "XBPM US X (µm)",                 "pv": "S15IDFE-XBPM:P1us:x:LowPass1s_DecimatedM", "checked": False, "locked": True},
+    {"label": "XBPM US Y (µm)",                 "pv": "S15IDFE-XBPM:P1us:y:LowPass1s_DecimatedM", "checked": False, "locked": True},
+    {"label": "XBPM DS X (µm)",                 "pv": "S15IDFE-XBPM:P1ds:x:LowPass1s_DecimatedM", "checked": False, "locked": True},
+    {"label": "XBPM DS Y (µm)",                 "pv": "S15IDFE-XBPM:P1ds:y:LowPass1s_DecimatedM", "checked": False, "locked": True},
 ]
 
 DEFAULT_MIRROR_STAGES = [
@@ -394,9 +464,19 @@ DEFAULT_SCAN = {
     "roll_start":  -0.05,
     "roll_stop":    0.05,
     "roll_steps":   21,
-    "settle_time":  0.1,
-    "peak_method":  "centroid",
+    "settle_time":        0.1,
+    "piezo_settle_time":  0.2,
     "piezo_center": 5.0,
+    "smart_edge_fraction":    0.2,
+    "smart_max_extend_steps": 10,
+    "smart_fine_sigma_range": 2.0,
+    "smart_fine_scan_iter":   3,
+    "dcm_piezo_start":  -1.0,
+    "dcm_piezo_stop":    1.0,
+    "dcm_piezo_steps":  21,
+    "mir_piezo_start":  -1.0,
+    "mir_piezo_stop":    1.0,
+    "mir_piezo_steps":  21,
 }
 
 DEFAULT_MIRROR_SCAN = {
@@ -412,11 +492,39 @@ DEFAULT_MIRROR_SCAN = {
     "mir_vfm_start":      -250.0,
     "mir_vfm_stop":        250.0,
     "mir_vfm_steps":       21,
+    "mir_slit_size_c":    2.0,
 }
 
 # ─── Simulation helpers ───────────────────────────────────────────────────────
 def gaussian(x, center, sigma, amp, offset=0.0):
     return amp * np.exp(-0.5 * ((x - center) / sigma) ** 2) + offset
+
+def super_gaussian(x, amplitude, center, sigma, p, offset):
+    return amplitude * np.exp(-np.abs((x - center) / sigma) ** p) + offset
+
+def fit_super_gaussian(xs, ys):
+    """Multi-start super-Gaussian fit (p∈{2,4,8,16}). Returns [amp,center,sigma,p,offset] or None."""
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    if len(xs) < 5:
+        return None
+    amp0 = float(np.max(ys) - np.min(ys))
+    cen0 = float(xs[np.argmax(ys)])
+    sig0 = float(max((xs[-1] - xs[0]) / 4.0, 1e-9))
+    off0 = float(np.min(ys))
+    best, best_rms = None, np.inf
+    for p_init in [2.0, 4.0, 8.0, 16.0]:
+        try:
+            lo = [0.0, xs[0], 1e-9, 0.5, -np.inf]
+            hi = [np.inf, xs[-1], xs[-1] - xs[0] + 1e-9, 64.0, np.inf]
+            popt, _ = curve_fit(super_gaussian, xs, ys,
+                                p0=[amp0, cen0, sig0, p_init, off0],
+                                bounds=(lo, hi), maxfev=3000)
+            rms = float(np.sqrt(np.mean((ys - super_gaussian(xs, *popt)) ** 2)))
+            if rms < best_rms:
+                best_rms, best = rms, popt
+        except Exception:
+            pass
+    return best
 
 def sim_scan_pitch(start, stop, nsteps, true_center, sigma=0.015, amp=1000.0, noise=20.0):
     xs = np.linspace(start, stop, nsteps)
@@ -443,6 +551,27 @@ def find_zero_crossing(xs, ys):
             if (y1 - y0) != 0:
                 return float(x0 - y0 * (x1 - x0) / (y1 - y0))
     return float(xs[np.argmin(np.abs(ys))])
+
+def fwhm_half_max(xs, ys):
+    """FWHM via linear interpolation at half-maximum. Suitable for square/flat-top profiles."""
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    baseline = np.min(ys)
+    peak     = np.max(ys)
+    if peak <= baseline:
+        return None
+    half = baseline + (peak - baseline) / 2.0
+    left = right = None
+    for i in range(len(ys) - 1):
+        if ys[i] <= half <= ys[i + 1] or ys[i] >= half >= ys[i + 1]:
+            t = (half - ys[i]) / (ys[i + 1] - ys[i])
+            x = xs[i] + t * (xs[i + 1] - xs[i])
+            if left is None:
+                left = x
+            else:
+                right = x
+    if left is None or right is None:
+        return None
+    return abs(right - left)
 
 # ─── EPICS interface (real or simulated) ─────────────────────────────────────
 class EpicsInterface:
@@ -474,10 +603,13 @@ class AlignmentWorker(QObject):
     scan_peak        = pyqtSignal(str, float)          # (motor, peak_x)
     bpm_update       = pyqtSignal(float, float, float) # x, y, intensity
     feedback_update  = pyqtSignal(bool, bool)          # h, v
-    mir_substep      = pyqtSignal(str, str)            # (step_id "A"–"D", status)
+    substep_status   = pyqtSignal(str, str)            # (key "step_sub", status)
     finished         = pyqtSignal(bool)                # success
+    confirm_needed   = pyqtSignal(str)                 # substep key, waiting for operator
+    scan_results_ready = pyqtSignal(dict)              # fit results keyed by label
 
-    def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True, mirror_stages=None):
+    def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True,
+                 mirror_stages=None, confirm_mode=False):
         super().__init__()
         self.pvs = pvs
         self.params = scan_params
@@ -485,7 +617,10 @@ class AlignmentWorker(QObject):
         self.simulate = simulate
         self.skip_mirror = skip_mirror
         self.mirror_stages = mirror_stages or []
-        self._abort = False
+        self.confirm_mode = confirm_mode
+        self._abort        = False
+        self._scan_results = {}   # populated during scans; emitted via scan_results_ready
+        self._confirm_event = threading.Event()
         self.epics = EpicsInterface(simulate=simulate)
 
     def abort(self):
@@ -522,6 +657,155 @@ class AlignmentWorker(QObject):
         self.log(f"  Warning: motor {motor_pv} did not finish in {timeout}s", "warn")
         return True
 
+    def confirm(self):
+        """Called from the UI thread when operator clicks Proceed."""
+        self._confirm_event.set()
+
+    def request_confirm(self, substep_key):
+        """Pause worker until operator clicks Proceed (or abort). Returns False if aborted."""
+        if not self.confirm_mode:
+            return True
+        self._confirm_event.clear()
+        self.confirm_needed.emit(substep_key)
+        while not self._confirm_event.is_set():
+            if self._abort:
+                return False
+            time.sleep(0.05)
+        return True
+
+    def _smart_scan_peak(self, scan_key, motor_pv, center, half_range, steps,
+                         sim_fn, substep_key):
+        """Adaptive scan for intensity peak. Returns (peak_pos, sigma) or (None, None)."""
+        p = self.params
+        edge_frac  = p.get("smart_edge_fraction",    0.2)
+        max_ext    = p.get("smart_max_extend_steps", 10)
+        fine_range = p.get("smart_fine_sigma_range", 2.0)
+        fine_iter  = p.get("smart_fine_scan_iter",   3)
+
+        lo, hi = center - half_range, center + half_range
+        step_size = (hi - lo) / max(steps - 1, 1)
+
+        xs_all, ys_all = [], []
+
+        def do_scan(a, b, n):
+            if self.simulate:
+                scan_xs, scan_ys = sim_fn(a, b, n)
+            else:
+                scan_xs = list(np.linspace(a, b, n))
+                scan_ys = []
+                for x in scan_xs:
+                    if self._abort: return None, None
+                    self.epics.put(motor_pv, x)
+                    if not self._wait_motor_done(motor_pv): return None, None
+                    if not self._sleep(p["settle_time"]): return None, None
+                    scan_ys.append(self.epics.get(self.pvs.get("i0", "I0")))
+            for x, y in zip(scan_xs, scan_ys):
+                if self._abort: return None, None
+                self.scan_point.emit(scan_key, float(x), float(y))
+                xs_all.append(float(x)); ys_all.append(float(y))
+                if not self._sleep(p["settle_time"]): return None, None
+            return scan_xs, scan_ys
+
+        # initial scan
+        rx, ry = do_scan(lo, hi, steps)
+        if rx is None: return None, None
+
+        # extend if peak near boundary
+        for _ in range(max_ext):
+            popt = fit_super_gaussian(xs_all, ys_all)
+            if popt is None: break
+            pk = popt[1]
+            span = xs_all[-1] - xs_all[0]
+            if pk < xs_all[0] + edge_frac * span:
+                new_lo = xs_all[0] - step_size * steps // 4
+                rx, ry = do_scan(new_lo, xs_all[0] - step_size, steps // 4 + 1)
+                if rx is None: return None, None
+            elif pk > xs_all[-1] - edge_frac * span:
+                new_hi = xs_all[-1] + step_size * steps // 4
+                rx, ry = do_scan(xs_all[-1] + step_size, new_hi, steps // 4 + 1)
+                if rx is None: return None, None
+            else:
+                break
+
+        popt = fit_super_gaussian(xs_all, ys_all)
+        if popt is None:
+            self.log(f"  WARNING: could not fit peak in {substep_key} scan — using best estimate", "warn")
+            best_x = float(np.asarray(xs_all)[np.argmax(ys_all)])
+            return best_x, None
+
+        pk, sig = popt[1], popt[2]
+
+        # fine scan iterations
+        prev_sig = sig
+        for _ in range(fine_iter):
+            fr = fine_range * abs(prev_sig)
+            rx, ry = do_scan(pk - fr, pk + fr, steps)
+            if rx is None: return None, None
+            popt2 = fit_super_gaussian(xs_all, ys_all)
+            if popt2 is None: break
+            pk, sig = popt2[1], popt2[2]
+            if prev_sig / (sig + 1e-30) < 2.0: break
+            prev_sig = sig
+
+        fwhm = 2.0 * sig * (np.log(2) ** (1.0 / max(popt[3], 0.5)))
+        if abs(pk - float(np.asarray(xs_all)[np.argmax(ys_all)])) < fwhm:
+            final = pk
+        else:
+            final = float(np.asarray(xs_all)[np.argmax(ys_all)])
+        self.scan_peak.emit(scan_key, final)
+        return final, sig
+
+    def _smart_scan_zero(self, scan_key, motor_pv, center, half_range, steps,
+                         sim_fn, substep_key):
+        """Adaptive scan for BPM zero-crossing. Returns zero_pos or None."""
+        p = self.params
+        edge_frac = p.get("smart_edge_fraction",    0.2)
+        max_ext   = p.get("smart_max_extend_steps", 10)
+
+        lo, hi = center - half_range, center + half_range
+        step_size = (hi - lo) / max(steps - 1, 1)
+        xs_all, ys_all = [], []
+
+        def do_scan(a, b, n):
+            if self.simulate:
+                scan_xs, scan_ys = sim_fn(a, b, n)
+            else:
+                scan_xs = list(np.linspace(a, b, n))
+                scan_ys = []
+                for x in scan_xs:
+                    if self._abort: return None, None
+                    self.epics.put(motor_pv, x)
+                    if not self._wait_motor_done(motor_pv): return None, None
+                    if not self._sleep(p["settle_time"]): return None, None
+                    scan_ys.append(self.epics.get(self.pvs.get("bpm_x", "BPMX")))
+            for x, y in zip(scan_xs, scan_ys):
+                if self._abort: return None, None
+                self.scan_point.emit(scan_key, float(x), float(y))
+                xs_all.append(float(x)); ys_all.append(float(y))
+                if not self._sleep(p["settle_time"]): return None, None
+            return scan_xs, scan_ys
+
+        rx, ry = do_scan(lo, hi, steps)
+        if rx is None: return None
+
+        # check if zero crossing is within the scan range, extend if not
+        for _ in range(max_ext):
+            arr = np.asarray(ys_all)
+            crosses = np.where(np.diff(np.sign(arr)))[0]
+            if len(crosses) > 0: break
+            span = xs_all[-1] - xs_all[0]
+            if arr[-1] < arr[0]:  # descending, zero may be to the right
+                rx, ry = do_scan(xs_all[-1] + step_size,
+                                 xs_all[-1] + step_size * (steps // 4), steps // 4 + 1)
+            else:
+                rx, ry = do_scan(xs_all[0] - step_size * (steps // 4),
+                                 xs_all[0] - step_size, steps // 4 + 1)
+            if rx is None: return None
+
+        zero = find_zero_crossing(xs_all, ys_all)
+        self.scan_peak.emit(scan_key, zero)
+        return zero
+
     def run(self):
         try:
             self._run_sequence()
@@ -540,29 +824,34 @@ class AlignmentWorker(QObject):
 
         # ── Step 1: Load settings ──────────────────────────────────────
         self.step_status.emit(1, "running")
-        self.log("━━ Step 1 — Load lookup table settings ━━")
+        self.log("━━ Step 1 — Load energy table settings ━━")
+        self.substep_status.emit("1_1a", "running")
         if not self._sleep(0.3): return self._abort_cleanup()
         self.log(f"  Mono E   = {row['mono_e']} keV")
         self.log(f"  Und E    = {row['ue']} keV")
         self.log(f"  Roll SP  = {row['roll']}")
         self.log(f"  Pitch SP = {row['pitch']}")
+        self.substep_status.emit("1_1a", "done")
         self.step_status.emit(1, "done")
         self.log("Step 1 complete.", "ok")
 
-        # ── Step 2: BPM off → motors → mirror out ─────────────────────
+        # ── Step 2: Apply energy table settings ───────────────────────
         self.step_status.emit(2, "running")
-        self.log("━━ Step 2 — Disable BPM feedback, move motors, retract mirror ━━")
+        self.log("━━ Step 2 — Apply energy table settings ━━")
 
+        # 2a: Turn off BPM feedback
+        self.substep_status.emit("2_2a", "running")
         self.log(f"  [{pvs['feedback_h']}] → 0  (H feedback OFF)", "warn")
         self.epics.put(pvs['feedback_h'], 0)
         self.log(f"  [{pvs['feedback_v']}] → 0  (V feedback OFF)", "warn")
         self.epics.put(pvs['feedback_v'], 0)
         self.feedback_update.emit(False, False)
         if not self._sleep(0.4): return self._abort_cleanup()
+        self.substep_status.emit("2_2a", "done")
 
-        self.log("  Moving motors to lookup table setpoints…")
-
-        # Undulator: set harmonic → set energy → trigger start
+        # 2b: Apply energy table settings (undulator + DCM)
+        self.substep_status.emit("2_2b", "running")
+        self.log("  Moving motors to energy table setpoints…")
         if pvs.get("und_harmonic"):
             self.epics.put(pvs["und_harmonic"], row["harmonic"])
             self.log(f"  [{pvs['und_harmonic']}] → {row['harmonic']}  (harmonic)", "ok")
@@ -574,7 +863,6 @@ class AlignmentWorker(QObject):
             self.epics.put(pvs["und_start"], 1)
             self.log(f"  [{pvs['und_start']}] → 1  (start undulator move)", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
-
         for key, pv_key, unit in [
             ("mono_e", "mono_energy", "keV"),
             ("roll",   "roll",        ""),
@@ -583,7 +871,10 @@ class AlignmentWorker(QObject):
             self.epics.put(pvs[pv_key], row[key])
             self.log(f"  [{pvs[pv_key]}] → {row[key]} {unit}", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
+        self.substep_status.emit("2_2b", "done")
 
+        # 2c: Mirror out
+        self.substep_status.emit("2_2c", "running")
         self.log("  Retracting mirror from beam path…")
         for stage in self.mirror_stages:
             if stage["pv"].strip():
@@ -592,6 +883,7 @@ class AlignmentWorker(QObject):
                 if not self._sleep(0.1): return self._abort_cleanup()
         if not self._sleep(0.4): return self._abort_cleanup()
         self.log("  Mirror retracted.", "ok")
+        self.substep_status.emit("2_2c", "done")
         self.step_status.emit(2, "done")
         self.log("Step 2 complete.", "ok")
 
@@ -600,68 +892,107 @@ class AlignmentWorker(QObject):
         self.log("━━ Step 3 — DCM piezo alignment ━━")
 
         # 3a: Center piezos
+        self.substep_status.emit("3_3a", "running")
         center = p["piezo_center"]
         self.log(f"  [{pvs['piezo_pitch']}] → {center}  (center)")
         self.epics.put(pvs['piezo_pitch'], center)
         self.log(f"  [{pvs['piezo_roll']}] → {center}  (center)")
         self.epics.put(pvs['piezo_roll'], center)
         if not self._sleep(0.4): return self._abort_cleanup()
+        self.substep_status.emit("3_3a", "done")
 
-        # 3b: Roll scan → BPM x = 0
-        self.log("  Scanning DCM roll → finding BPM x = 0 zero-crossing…")
-        true_zero = random.uniform(-0.005, 0.005)
-        xs_roll, ys_roll = sim_scan_roll_bpm(
-            row["roll"] + p["roll_start"], row["roll"] + p["roll_stop"], p["roll_steps"], true_zero
+        # 3b: Pitch scan → intensity peak (coarse, before roll)
+        self.substep_status.emit("3_3b", "running")
+        self.log("  Scanning DCM pitch → finding intensity peak (coarse)…")
+        _true_peak_coarse = row["pitch"] + random.uniform(-0.01, 0.01)
+        def _sim_pitch_coarse(a, b, n):
+            return sim_scan_pitch(a, b, n, _true_peak_coarse)
+        pitch_coarse, _sig3b = self._smart_scan_peak(
+            "pitch", pvs['pitch'],
+            center=row["pitch"],
+            half_range=(p["pitch_stop"] - p["pitch_start"]) / 2.0,
+            steps=p["pitch_steps"],
+            sim_fn=_sim_pitch_coarse,
+            substep_key="3_3b",
         )
-        for x, y in zip(xs_roll, ys_roll):
-            if self._abort: return self._abort_cleanup()
-            self.scan_point.emit("roll", float(x), float(y))
-            self.bpm_update.emit(float(y), 0.0, 0.5)
-            if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+        if self._abort: return self._abort_cleanup()
+        if pitch_coarse is None:
+            pitch_coarse = row["pitch"]
+            self.log("  INSUFFICIENT DATA: using table pitch value as fallback", "warn")
+        self.epics.put(pvs['pitch'], pitch_coarse)
+        self.log(f"  Intensity peak at pitch = {pitch_coarse:.6f} → moved", "ok")
+        self.substep_status.emit("3_3b", "waiting")
+        if not self.request_confirm("3_3b"): return self._abort_cleanup()
+        self.substep_status.emit("3_3b", "done")
 
-        roll_zero = find_zero_crossing(xs_roll, ys_roll)
-        self.scan_peak.emit("roll", roll_zero)
+        # 3c: Roll scan → BPM x = 0
+        self.substep_status.emit("3_3c", "running")
+        self.log("  Scanning DCM roll → finding BPM x = 0 zero-crossing…")
+        _true_zero = random.uniform(-0.005, 0.005)
+        def _sim_roll(a, b, n):
+            return sim_scan_roll_bpm(a, b, n, _true_zero)
+        roll_zero = self._smart_scan_zero(
+            "roll", pvs['roll'],
+            center=row["roll"],
+            half_range=(p["roll_stop"] - p["roll_start"]) / 2.0,
+            steps=p["roll_steps"],
+            sim_fn=_sim_roll,
+            substep_key="3_3c",
+        )
+        if self._abort: return self._abort_cleanup()
+        if roll_zero is None:
+            roll_zero = row["roll"]
+            self.log("  INSUFFICIENT DATA: using table roll value as fallback", "warn")
         self.epics.put(pvs['roll'], roll_zero)
         self.log(f"  BPM x zero-crossing at roll = {roll_zero:.6f} → moved", "ok")
+        self.substep_status.emit("3_3c", "waiting")
+        if not self.request_confirm("3_3c"): return self._abort_cleanup()
+        self.substep_status.emit("3_3c", "done")
 
-        # 3c: Pitch scan → intensity peak
-        self.log("  Scanning DCM pitch → finding intensity peak…")
-        true_peak = row["pitch"] + random.uniform(-0.01, 0.01)
-        xs_pitch, ys_pitch = sim_scan_pitch(
-            row["pitch"] + p["pitch_start"],
-            row["pitch"] + p["pitch_stop"],
-            p["pitch_steps"],
-            true_peak,
+        # 3d: Pitch scan → intensity peak (fine, after roll)
+        self.substep_status.emit("3_3d", "running")
+        self.log("  Scanning DCM pitch → finding intensity peak (fine)…")
+        _true_peak = pitch_coarse + random.uniform(-0.005, 0.005)
+        def _sim_pitch_fine(a, b, n):
+            return sim_scan_pitch(a, b, n, _true_peak)
+        pitch_peak, _sig3d = self._smart_scan_peak(
+            "pitch", pvs['pitch'],
+            center=pitch_coarse,
+            half_range=(p["pitch_stop"] - p["pitch_start"]) / 2.0,
+            steps=p["pitch_steps"],
+            sim_fn=_sim_pitch_fine,
+            substep_key="3_3d",
         )
-        for x, y in zip(xs_pitch, ys_pitch):
-            if self._abort: return self._abort_cleanup()
-            self.scan_point.emit("pitch", float(x), float(y))
-            self.bpm_update.emit(roll_zero + random.uniform(-0.001, 0.001),
-                                 random.uniform(-0.002, 0.002), float(y) / 1000.0)
-            if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
-
-        pitch_peak = find_peak_centroid(xs_pitch, ys_pitch)
-        self.scan_peak.emit("pitch", pitch_peak)
+        if self._abort: return self._abort_cleanup()
+        if pitch_peak is None:
+            pitch_peak = pitch_coarse
+            self.log("  INSUFFICIENT DATA: using coarse pitch value as fallback", "warn")
         self.epics.put(pvs['pitch'], pitch_peak)
         self.log(f"  Intensity peak at pitch = {pitch_peak:.6f} → moved", "ok")
         self.bpm_update.emit(roll_zero + random.uniform(-0.0005, 0.0005),
                              random.uniform(-0.001, 0.001), 0.97)
+        self.substep_status.emit("3_3d", "waiting")
+        if not self.request_confirm("3_3d"): return self._abort_cleanup()
+        self.substep_status.emit("3_3d", "done")
         self.step_status.emit(3, "done")
         self.log("Step 3 complete.", "ok")
+
+        # Snapshot intensities before mirror goes in
+        if self.simulate:
+            self._scan_results["BPM Max Intensity w/o Mirror"]  = "sim"
+            self._scan_results["MonP Max Intensity w/o Mirror"] = "sim"
+        else:
+            _bpm_i  = self.epics.get(pvs.get("bpm_intensity", ""))
+            _monp_i = self.epics.get(pvs.get("ion_chamber", ""))
+            self._scan_results["BPM Max Intensity w/o Mirror"]  = (
+                f"{_bpm_i:.6g}" if isinstance(_bpm_i, (int, float)) else "—")
+            self._scan_results["MonP Max Intensity w/o Mirror"] = (
+                f"{_monp_i:.6g}" if isinstance(_monp_i, (int, float)) else "—")
 
         # ── Step 4: Mirror alignment (optional) ───────────────────────
         if self.skip_mirror:
             self.step_status.emit(4, "done")
             self.log("━━ Step 4 — Mirror alignment skipped ━━", "warn")
-            # Mirror was retracted in Step 2; move it back in now
-            self.log("  Moving mirror into beam path…")
-            for stage in self.mirror_stages:
-                if stage["pv"].strip():
-                    self.epics.put(stage["pv"], stage["val_in"])
-                    self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
-                    if not self._sleep(0.1): return self._abort_cleanup()
-            if not self._sleep(0.4): return self._abort_cleanup()
-            self.log("  Mirror in position.", "ok")
         else:
             self.step_status.emit(4, "running")
             self.log("━━ Step 4 — Mirror alignment ━━")
@@ -687,6 +1018,7 @@ class AlignmentWorker(QObject):
             slit_cen_stop  = p.get("mir_slit_cen_stop", 2.0)
             slit_cen_steps = int(p.get("mir_slit_cen_steps", 21))
             slit_size_b    = p.get("mir_slit_size_b", 0.2)
+            slit_size_c    = p.get("mir_slit_size_c", 2.0)
             vdm_start      = p.get("mir_vdm_start", -500.0)
             vdm_stop       = p.get("mir_vdm_stop", 500.0)
             vdm_steps      = int(p.get("mir_vdm_steps", 21))
@@ -695,7 +1027,7 @@ class AlignmentWorker(QObject):
             vfm_steps      = int(p.get("mir_vfm_steps", 21))
 
             # ── 4A: Slit scan (mirror out) → find beam center ─────────
-            self.mir_substep.emit("A", "running")
+            self.substep_status.emit("4_4A", "running")
             self.log("  4A: Slit center scan — mirror out, finding beam center…")
             slit_peak = 0.0
             if top_pv and bot_pv:
@@ -721,7 +1053,7 @@ class AlignmentWorker(QObject):
                            if self.simulate else (self.epics.get(signal_pv) or 0.0))
                     ys_slit.append(sig)
                     self.scan_point.emit("mir_slit_cen", float(cen), float(sig))
-                    if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+                    if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
                 slit_peak = find_peak_centroid(xs_slit, np.array(ys_slit))
                 self.scan_peak.emit("mir_slit_cen", slit_peak)
@@ -732,10 +1064,12 @@ class AlignmentWorker(QObject):
                 if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
             else:
                 self.log("  Slit PVs not configured — skipping 4A slit scan.", "warn")
-            self.mir_substep.emit("A", "done")
+            self.substep_status.emit("4_4A", "waiting")
+            if not self.request_confirm("4_4A"): return self._abort_cleanup()
+            self.substep_status.emit("4_4A", "done")
 
-            # ── 4B: Mirror in → close slit → pitch piezo → BPMY = 0 ──
-            self.mir_substep.emit("B", "running")
+            # ── 4B: Mirror in ─────────────────────────────────────────
+            self.substep_status.emit("4_4B", "running")
             self.log("  4B: Moving mirror into beam path…")
             for stage in self.mirror_stages:
                 if stage["pv"].strip():
@@ -744,7 +1078,10 @@ class AlignmentWorker(QObject):
                     if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.5): return self._abort_cleanup()
             self.log("  Mirror in position.", "ok")
+            self.substep_status.emit("4_4B", "done")
 
+            # ── 4C: Close slit → pitch piezo → BPMY = 0 ──────────────
+            self.substep_status.emit("4_4C", "running")
             if top_pv and bot_pv:
                 self.log(f"  Narrowing slit to {slit_size_b} mm for mirror scan")
                 self.epics.put(top_pv, slit_peak + slit_size_b / 2.0)
@@ -755,13 +1092,16 @@ class AlignmentWorker(QObject):
             if mir_piezo_pv:
                 self.log("  Scanning mirror pitch piezo → BPMY = 0…")
                 piezo_cur = self.epics.get(mir_piezo_pv) or p.get("piezo_center", 5.0)
-                xs_piezo = np.linspace(piezo_cur - 1.0, piezo_cur + 1.0, 21)
+                mp_start = p.get("mir_piezo_start", -1.0)
+                mp_stop  = p.get("mir_piezo_stop",   1.0)
+                mp_steps = int(p.get("mir_piezo_steps", 21))
+                xs_piezo = np.linspace(piezo_cur + mp_start, piezo_cur + mp_stop, mp_steps)
                 ys_bpmy = []
                 _piezo_zero = piezo_cur + random.uniform(-0.1, 0.1)
                 for px in xs_piezo:
                     if self._abort: return self._abort_cleanup()
                     self.epics.put(mir_piezo_pv, px)
-                    if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+                    if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
                     bpmy = (-(px - _piezo_zero) * 0.5 + random.uniform(-0.002, 0.002)
                             if self.simulate else (self.epics.get(pvs["bpm_y"]) or 0.0))
                     ys_bpmy.append(bpmy)
@@ -774,11 +1114,13 @@ class AlignmentWorker(QObject):
                 self.log(f"  BPMY zero-crossing at piezo = {piezo_zero:.5f} → moved", "ok")
             else:
                 self.log("  Mirror piezo pitch PV not configured — skipping BPMY centering.", "warn")
-            self.mir_substep.emit("B", "done")
+            self.substep_status.emit("4_4C", "waiting")
+            if not self.request_confirm("4_4C"): return self._abort_cleanup()
+            self.substep_status.emit("4_4C", "done")
 
-            # ── 4C: Scan VDM:Y → find peak → move ────────────────────
-            self.mir_substep.emit("C", "running")
-            self.log("  4C: Scanning VDM:Y → finding signal peak…")
+            # ── 4D: Scan VDM:Y → find peak → move ────────────────────
+            self.substep_status.emit("4_4D", "running")
+            self.log("  4D: Scanning VDM:Y → finding signal peak…")
             vdm_cur = self.epics.get(vdm_pv) or 0.0
             xs_vdm = np.linspace(vdm_cur + vdm_start, vdm_cur + vdm_stop, vdm_steps)
             ys_vdm = []
@@ -791,18 +1133,23 @@ class AlignmentWorker(QObject):
                        if self.simulate else (self.epics.get(signal_pv) or 0.0))
                 ys_vdm.append(sig)
                 self.scan_point.emit("mir_vdm", float(vdm_pos), float(sig))
-                if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+                if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
             vdm_peak = find_peak_centroid(xs_vdm, np.array(ys_vdm))
             self.scan_peak.emit("mir_vdm", vdm_peak)
+            _fwhm4d = fwhm_half_max(xs_vdm, np.array(ys_vdm))
+            if _fwhm4d is not None:
+                self._scan_results["VDM Y FWHM @ 4D (µm)"] = f"{_fwhm4d:.2f}"
             self.epics.put(vdm_pv, vdm_peak)
             if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
             self.log(f"  VDM:Y peak at {vdm_peak:.2f} → moved", "ok")
-            self.mir_substep.emit("C", "done")
+            self.substep_status.emit("4_4D", "waiting")
+            if not self.request_confirm("4_4D"): return self._abort_cleanup()
+            self.substep_status.emit("4_4D", "done")
 
-            # ── 4D: Coupled VFM+VDM scan (VDM step = 2× VFM step) ────
-            self.mir_substep.emit("D", "running")
-            self.log("  4D: Coupled VFM:Y + VDM:Y scan (VDM step = 2× VFM step)…")
+            # ── 4E: Coupled VFM+VDM scan (VDM step = 2× VFM step) ────
+            self.substep_status.emit("4_4E", "running")
+            self.log("  4E: Coupled VFM:Y + VDM:Y scan (VDM step = 2× VFM step)…")
             vfm_cur  = self.epics.get(vfm_pv) or 0.0
             vdm_ref  = self.epics.get(vdm_pv) or vdm_peak
             xs_vfm   = np.linspace(vfm_cur + vfm_start, vfm_cur + vfm_stop, vfm_steps)
@@ -820,18 +1167,30 @@ class AlignmentWorker(QObject):
                        if self.simulate else (self.epics.get(signal_pv) or 0.0))
                 ys_coupled.append(sig)
                 self.scan_point.emit("mir_coupled", float(vfm_pos), float(sig))
-                if not self._sleep(p["settle_time"] * 0.5): return self._abort_cleanup()
+                if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
             vfm_peak_pos    = find_peak_centroid(xs_vfm, np.array(ys_coupled))
             vfm_delta_final = vfm_peak_pos - vfm_cur
             vdm_final       = vdm_ref + 2.0 * vfm_delta_final
             self.scan_peak.emit("mir_coupled", vfm_peak_pos)
+            _fwhm4e = fwhm_half_max(xs_vfm, np.array(ys_coupled))
+            if _fwhm4e is not None:
+                self._scan_results["VFM Y FWHM @ 4E (µm)"] = f"{_fwhm4e:.2f}"
             self.epics.put(vfm_pv, vfm_peak_pos)
             if not self._wait_motor_done(vfm_pv): return self._abort_cleanup()
             self.epics.put(vdm_pv, vdm_final)
             if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
             self.log(f"  VFM:Y → {vfm_peak_pos:.2f}  VDM:Y → {vdm_final:.2f}  (2× delta applied)", "ok")
-            self.mir_substep.emit("D", "done")
+            self.substep_status.emit("4_4E", "waiting")
+            if not self.request_confirm("4_4E"): return self._abort_cleanup()
+            self.substep_status.emit("4_4E", "done")
+
+            if top_pv and bot_pv:
+                self.log(f"  Opening slit to {slit_size_c} mm after 4E")
+                self.epics.put(top_pv, slit_peak + slit_size_c / 2.0)
+                self.epics.put(bot_pv, slit_peak - slit_size_c / 2.0)
+                if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
 
             self.step_status.emit(4, "done")
             self.log("Step 4 complete.", "ok")
@@ -840,6 +1199,20 @@ class AlignmentWorker(QObject):
         self.step_status.emit(5, "running")
         self.log("━━ Step 5 — Enable feedback loops ━━")
 
+        # If step 4 was skipped, mirror was retracted in step 2 — insert it now
+        if self.skip_mirror:
+            self.substep_status.emit("5_5mir", "running")
+            self.log("  Step 4 skipped — moving mirror into beam path now…")
+            for stage in self.mirror_stages:
+                if stage["pv"].strip():
+                    self.epics.put(stage["pv"], stage["val_in"])
+                    self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
+                    if not self._sleep(0.1): return self._abort_cleanup()
+            if not self._sleep(0.4): return self._abort_cleanup()
+            self.log("  Mirror in position.", "ok")
+            self.substep_status.emit("5_5mir", "done")
+
+        self.substep_status.emit("5_5a", "running")
         self.log(f"  Enabling H feedback: DCM piezo roll → BPM x = 0…")
         if not self._sleep(0.5): return self._abort_cleanup()
         self.epics.put(pvs['feedback_h'], 1)
@@ -847,28 +1220,89 @@ class AlignmentWorker(QObject):
         self.bpm_update.emit(random.uniform(-0.0002, 0.0002),
                              random.uniform(-0.001, 0.001), 0.97)
         self.log(f"  [{pvs['feedback_h']}] → 1  (H feedback ON)", "ok")
+        self.substep_status.emit("5_5a", "done")
 
-        self.log("  Maximising BPM intensity via DCM piezo pitch…")
-        if not self._sleep(0.6): return self._abort_cleanup()
-        self.bpm_update.emit(random.uniform(-0.0001, 0.0001),
-                             random.uniform(-0.001, 0.001), 0.99)
-        self.log("  Peak intensity reached.", "ok")
+        self.substep_status.emit("5_5b", "running")
+        self.log("  Scanning DCM piezo pitch → max intensity…")
+        dcm_piezo_pv = pvs.get("piezo_pitch", "")
+        dp_start = p.get("dcm_piezo_start", -1.0)
+        dp_stop  = p.get("dcm_piezo_stop",   1.0)
+        dp_steps = int(p.get("dcm_piezo_steps", 21))
+        if dcm_piezo_pv:
+            piezo_cur = self.epics.get(dcm_piezo_pv) or p.get("piezo_center", 5.0)
+            xs_dcm = np.linspace(piezo_cur + dp_start, piezo_cur + dp_stop, dp_steps)
+            ys_dcm = []
+            _dcm_true = piezo_cur + random.uniform(-0.2, 0.2)
+            for px in xs_dcm:
+                if self._abort: return self._abort_cleanup()
+                self.epics.put(dcm_piezo_pv, px)
+                if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
+                sig = (gaussian(px, _dcm_true, 0.3, 1000.0, 10.0) + random.uniform(-5, 5)
+                       if self.simulate else (self.epics.get(pvs.get("i0", "")) or 0.0))
+                ys_dcm.append(sig)
+                self.scan_point.emit("pitch", float(px), float(sig))
+                self.bpm_update.emit(random.uniform(-0.0001, 0.0001),
+                                     random.uniform(-0.001, 0.001), float(sig) / 1000.0)
+            dcm_piezo_peak = find_peak_centroid(xs_dcm, np.array(ys_dcm))
+            self.scan_peak.emit("pitch", dcm_piezo_peak)
+            self.epics.put(dcm_piezo_pv, dcm_piezo_peak)
+            self.log(f"  Intensity peak at DCM piezo = {dcm_piezo_peak:.5f} → moved", "ok")
+        else:
+            self.log("  DCM piezo pitch PV not configured — skipping.", "warn")
+        self.substep_status.emit("5_5b", "waiting")
+        if not self.request_confirm("5_5b"): return self._abort_cleanup()
+        self.substep_status.emit("5_5b", "done")
 
-        self.log("  Tweaking mirror piezo pitch → BPM y = 0…")
-        if not self._sleep(0.6): return self._abort_cleanup()
-        self.bpm_update.emit(random.uniform(-0.0001, 0.0001),
-                             random.uniform(-0.0002, 0.0002), 0.98)
-        self.log("  BPM y ≈ 0 achieved.", "ok")
+        # Snapshot BPM y after DCM piezo pitch optimisation
+        if self.simulate:
+            self._scan_results["BPM Y @ 5B (µm)"] = "sim"
+        else:
+            _bpmy_5b = self.epics.get(pvs.get("bpm_y", ""))
+            self._scan_results["BPM Y @ 5B (µm)"] = (
+                f"{_bpmy_5b:.6g}" if isinstance(_bpmy_5b, (int, float)) else "—")
 
+        self.substep_status.emit("5_5c", "running")
+        self.log("  Scanning mirror piezo pitch → BPM y = 0…")
+        mir_piezo_pv5 = pvs.get("mir_piezo_pitch", "")
+        mp_start = p.get("mir_piezo_start", -1.0)
+        mp_stop  = p.get("mir_piezo_stop",   1.0)
+        mp_steps = int(p.get("mir_piezo_steps", 21))
+        if mir_piezo_pv5:
+            piezo_cur5 = self.epics.get(mir_piezo_pv5) or p.get("piezo_center", 5.0)
+            xs_mp = np.linspace(piezo_cur5 + mp_start, piezo_cur5 + mp_stop, mp_steps)
+            ys_mp = []
+            _mp_zero = piezo_cur5 + random.uniform(-0.1, 0.1)
+            for px in xs_mp:
+                if self._abort: return self._abort_cleanup()
+                self.epics.put(mir_piezo_pv5, px)
+                if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
+                bpmy = (-(px - _mp_zero) * 0.5 + random.uniform(-0.002, 0.002)
+                        if self.simulate else (self.epics.get(pvs.get("bpm_y", "")) or 0.0))
+                ys_mp.append(bpmy)
+                self.scan_point.emit("mir_piezo", float(px), float(bpmy))
+                self.bpm_update.emit(random.uniform(-0.0001, 0.0001), float(bpmy), 0.98)
+            mp_zero = find_zero_crossing(xs_mp, np.array(ys_mp))
+            self.scan_peak.emit("mir_piezo", mp_zero)
+            self.epics.put(mir_piezo_pv5, mp_zero)
+            self.log(f"  BPM y zero-crossing at mirror piezo = {mp_zero:.5f} → moved", "ok")
+        else:
+            self.log("  Mirror piezo pitch PV not configured — skipping.", "warn")
+        self.substep_status.emit("5_5c", "waiting")
+        if not self.request_confirm("5_5c"): return self._abort_cleanup()
+        self.substep_status.emit("5_5c", "done")
+
+        self.substep_status.emit("5_5d", "running")
         self.log(f"  Enabling V feedback: DCM piezo pitch → BPM y = 0…")
         if not self._sleep(0.4): return self._abort_cleanup()
         self.epics.put(pvs['feedback_v'], 1)
         self.feedback_update.emit(True, True)
         self.log(f"  [{pvs['feedback_v']}] → 1  (V feedback ON)", "ok")
+        self.substep_status.emit("5_5d", "done")
 
         self.step_status.emit(5, "done")
         self.log("Step 5 complete.", "ok")
         self.log("━━ Alignment sequence finished successfully ━━", "ok")
+        self.scan_results_ready.emit(dict(self._scan_results))
         self.finished.emit(True)
 
     def _abort_cleanup(self):
@@ -918,6 +1352,14 @@ def make_separator():
     line.setStyleSheet(f"color: {PAL['border']};")
     return line
 
+
+class NoScrollSpinBox(QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+class NoScrollDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
 
 def styled_button(text, obj_name="", min_width=0):
     btn = QPushButton(text)
@@ -1077,20 +1519,15 @@ class BeamPathWidget(QWidget):
 
 # ─── Log widget ───────────────────────────────────────────────────────────────
 class LogWidget(QTextEdit):
-    COLORS = {
-        "info":  PAL["text_sec"],
-        "ok":    PAL["green"],
-        "warn":  PAL["amber"],
-        "error": PAL["red"],
-    }
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setMaximumHeight(200)
 
     def append_log(self, msg, level="info"):
-        color = self.COLORS.get(level, PAL["text_sec"])
+        _colors = {"info": PAL["text_sec"], "ok": PAL["green"],
+                   "warn": PAL["amber"],    "error": PAL["red"]}
+        color = _colors.get(level, PAL["text_sec"])
         ts = time.strftime("%H:%M:%S")
         self.append(
             f'<span style="color:{PAL["text_dim"]}">{ts}</span> '
@@ -1101,12 +1538,25 @@ class LogWidget(QTextEdit):
 
 # ─── Setup Tab ───────────────────────────────────────────────────────────────
 class SetupTab(QWidget):
-    changed = pyqtSignal()
+    changed          = pyqtSignal()
+    pv_readback      = pyqtSignal(str, str)   # (key, value_str)
+    _string_refresh  = pyqtSignal(str)         # key — triggers Qt-thread string read
+
+    _RBK_MONO = "font-family: 'JetBrains Mono',Consolas,monospace; font-size: 11px; padding: 0 6px; min-width: 88px;"
+
+    @staticmethod
+    def _rbk_style(variant: str) -> str:
+        c = PAL['cyan'] if variant == "ok" else (PAL['amber'] if variant == "err" else PAL['text_dim'])
+        return f"color: {c}; {SetupTab._RBK_MONO}"
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pv_fields = {}
-        self._scan_fields = {}
+        self._pv_fields          = {}
+        self._scan_fields        = {}
+        self._pv_value_labels    = {}
+        self._monitored_pvs      = {}   # key → epics.PV object
+        self._resubscribe_timers = {}   # key → QTimer (debounce)
+        self._string_refresh.connect(self._on_string_refresh)
         self._build()
 
     def _build(self):
@@ -1135,34 +1585,63 @@ class SetupTab(QWidget):
         motor_box = QGroupBox("Motor PVs")
         motor_lay = QGridLayout(motor_box)
         motor_lay.setSpacing(8)
+        motor_lay.setColumnStretch(1, 1)
+        hdr_rbv = QLabel("RBV")
+        hdr_rbv.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 10px; letter-spacing: 1px;")
+        motor_lay.addWidget(hdr_rbv, 0, 2, Qt.AlignmentFlag.AlignHCenter)
         for row, (key, label) in enumerate(motor_labels.items()):
             motor_lay.addWidget(QLabel(label), row, 0)
             ed = QLineEdit(DEFAULT_PVS[key])
             self._pv_fields[key] = ed
             motor_lay.addWidget(ed, row, 1)
+            rbk = QLabel("—")
+            rbk.setStyleSheet(self._rbk_style("dim"))
+            rbk.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._pv_value_labels[key] = rbk
+            motor_lay.addWidget(rbk, row, 2)
 
         other_labels = {
+            # Undulator
             "und_energy":      "Undulator Energy",
+            "und_harmonic":    "Undulator Harmonic",
+            "und_start":       "Undulator Start",
+            # DCM Piezos
             "piezo_pitch":     "DCM Piezo Pitch",
             "piezo_roll":      "DCM Piezo Roll",
+            # BPM
             "bpm_x":           "BPM X readback",
             "bpm_y":           "BPM Y readback",
             "bpm_intensity":   "BPM Intensity",
+            "bpm_sen":         "BPM Sensitivity",
+            # Feedback
             "feedback_h":      "H Feedback PV",
             "feedback_v":      "V Feedback PV",
-            "und_harmonic":    "Undulator Harmonic PV",
-            "und_start":       "Undulator Start PV",
+            # Mirror
             "mir_piezo_pitch": "Mirror Piezo Pitch",
+            "mir_slit_center": "Mirror Slit Center",
+            "mir_slit_size":   "Mirror Slit Size",
+            # Ion Chamber
             "ion_chamber":     "Ion Chamber",
+            "ic_sen_unit":     "Ion Chamber Sen Unit",
+            "ic_sen_num":      "Ion Chamber Sen Num",
         }
         other_box = QGroupBox("Other PVs")
         other_lay = QGridLayout(other_box)
         other_lay.setSpacing(8)
+        other_lay.setColumnStretch(1, 1)
+        hdr_rbv2 = QLabel("Value")
+        hdr_rbv2.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 10px; letter-spacing: 1px;")
+        other_lay.addWidget(hdr_rbv2, 0, 2, Qt.AlignmentFlag.AlignHCenter)
         for row, (key, label) in enumerate(other_labels.items()):
             other_lay.addWidget(QLabel(label), row, 0)
             ed = QLineEdit(DEFAULT_PVS[key])
             self._pv_fields[key] = ed
             other_lay.addWidget(ed, row, 1)
+            rbk = QLabel("—")
+            rbk.setStyleSheet(self._rbk_style("dim"))
+            rbk.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._pv_value_labels[key] = rbk
+            other_lay.addWidget(rbk, row, 2)
 
         pv_col.addWidget(motor_box)
         pv_col.addWidget(other_box)
@@ -1174,36 +1653,40 @@ class SetupTab(QWidget):
         scan_box = QGroupBox("Scan Parameters")
         scan_lay = QGridLayout(scan_box)
         scan_defs = [
-            ("pitch_start",  "Pitch scan start",  QDoubleSpinBox, -1.0, 0.0, -0.05, 4),
-            ("pitch_stop",   "Pitch scan stop",   QDoubleSpinBox,  0.0, 1.0,  0.05, 4),
+            ("pitch_start",  "Pitch scan start",  QDoubleSpinBox, -1000.0, 0.0, -0.05, 4),
+            ("pitch_stop",   "Pitch scan stop",   QDoubleSpinBox,     0.0, 1000.0,  0.05, 4),
             ("pitch_steps",  "Pitch scan steps",  QSpinBox,        5, 200,   25,   0),
-            ("roll_start",   "Roll scan start",   QDoubleSpinBox, -1.0, 0.0, -0.05, 4),
-            ("roll_stop",    "Roll scan stop",    QDoubleSpinBox,  0.0, 1.0,  0.05, 4),
+            ("roll_start",   "Roll scan start",   QDoubleSpinBox, -1000.0, 0.0, -0.05, 4),
+            ("roll_stop",    "Roll scan stop",    QDoubleSpinBox,     0.0, 1000.0,  0.05, 4),
             ("roll_steps",   "Roll scan steps",   QSpinBox,        5, 200,   21,   0),
-            ("settle_time",  "Settle time (s)",   QDoubleSpinBox,  0.0, 5.0,  0.1,  2),
+            ("settle_time",        "Settle time (s)",        QDoubleSpinBox, 0.0, 5.0, 0.1, 2),
+            ("piezo_settle_time",  "Piezo settle time (s)",  QDoubleSpinBox, 0.0, 5.0, 0.2, 2),
             ("piezo_center", "Piezo center value",QDoubleSpinBox,  0.0, 10.0, 5.0,  1),
+            ("smart_edge_fraction",    "Smart scan edge fraction",   QDoubleSpinBox, 0.05, 0.5,  0.2, 2),
+            ("smart_max_extend_steps", "Smart scan max extend steps",QSpinBox,       1,    50,   10,  0),
+            ("smart_fine_sigma_range", "Fine scan range (σ)",        QDoubleSpinBox, 0.5,  10.0, 2.0, 1),
+            ("smart_fine_scan_iter",   "Fine scan iterations",       QSpinBox,       1,    10,   3,   0),
+            ("dcm_piezo_start",  "DCM pitch piezo scan start",    QDoubleSpinBox, -1000.0, 0.0,  -1.0, 3),
+            ("dcm_piezo_stop",   "DCM pitch piezo scan stop",     QDoubleSpinBox,     0.0, 1000.0, 1.0, 3),
+            ("dcm_piezo_steps",  "DCM pitch piezo scan steps",    QSpinBox,        3, 200,   21,   0),
+            ("mir_piezo_start",  "Mirror pitch piezo scan start", QDoubleSpinBox, -1000.0, 0.0,  -1.0, 3),
+            ("mir_piezo_stop",   "Mirror pitch piezo scan stop",  QDoubleSpinBox,     0.0, 1000.0, 1.0, 3),
+            ("mir_piezo_steps",  "Mirror pitch piezo scan steps", QSpinBox,        3, 200,   21,   0),
         ]
         for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(scan_defs):
             scan_lay.addWidget(QLabel(lbl), r, 0)
             if cls == QDoubleSpinBox:
-                sb = QDoubleSpinBox()
+                sb = NoScrollDoubleSpinBox()
                 sb.setDecimals(dec)
                 sb.setRange(mn, mx)
                 sb.setValue(dflt)
             else:
-                sb = QSpinBox()
+                sb = NoScrollSpinBox()
                 sb.setRange(mn, mx)
                 sb.setValue(dflt)
             sb.setMinimumWidth(100)
             self._scan_fields[key] = sb
             scan_lay.addWidget(sb, r, 1)
-
-        # Peak method
-        scan_lay.addWidget(QLabel("Peak method"), len(scan_defs), 0)
-        pm = QComboBox()
-        pm.addItems(["centroid", "gaussian_fit"])
-        self._scan_fields["peak_method"] = pm
-        scan_lay.addWidget(pm, len(scan_defs), 1)
 
         conn_box = QGroupBox("Connection")
         conn_lay = QVBoxLayout(conn_box)
@@ -1257,6 +1740,121 @@ class SetupTab(QWidget):
             elif isinstance(w, QComboBox):
                 w.currentTextChanged.connect(self.changed)
         self.sim_check.toggled.connect(self.changed)
+        self.sim_check.toggled.connect(self._on_sim_toggled)
+
+        # Live readback via EPICS monitors (callbacks → Qt signal → label update)
+        self.pv_readback.connect(self._on_pv_readback)
+        # Debounce re-subscribe when a PV name is edited
+        for key, ed in self._pv_fields.items():
+            ed.textChanged.connect(lambda _text, k=key: self._schedule_resubscribe(k))
+        if EPICS_AVAILABLE and not self.sim_check.isChecked():
+            self._start_monitoring()
+
+    # ── sim-mode toggle ──────────────────────────────────────────────────────
+    def _on_sim_toggled(self, is_sim: bool):
+        if is_sim or not EPICS_AVAILABLE:
+            self._stop_monitoring()
+        else:
+            self._start_monitoring()
+
+    # ── EPICS monitor management ─────────────────────────────────────────────
+    def _start_monitoring(self):
+        for key in self._pv_fields:
+            self._subscribe_pv(key)
+
+    def _stop_monitoring(self):
+        for pv in self._monitored_pvs.values():
+            try:
+                pv.disconnect()
+            except Exception:
+                pass
+        self._monitored_pvs.clear()
+        for lbl in self._pv_value_labels.values():
+            lbl.setText("—")
+            lbl.setStyleSheet(self._RBK_STYLE_DIM)
+
+    def _subscribe_pv(self, key: str):
+        # Tear down any existing subscription for this key
+        old = self._monitored_pvs.pop(key, None)
+        if old is not None:
+            try:
+                old.disconnect()
+            except Exception:
+                pass
+
+        pv_name = self._pv_fields[key].text().strip()
+        if not pv_name or self.sim_check.isChecked() or not EPICS_AVAILABLE:
+            self.pv_readback.emit(key, "—")
+            return
+
+        # Motors: monitor .RBV field
+        actual = (pv_name + ".RBV") if key in MOTOR_PV_KEYS else pv_name
+
+        _string_keys = {"bpm_sen", "ic_sen_unit", "ic_sen_num"}
+
+        def _value_cb(value=None, char_value=None, **_kw):
+            if value is None:
+                return
+            if key in _string_keys:
+                # Emit signal to do pv.get(as_string=True) on the Qt thread
+                self._string_refresh.emit(key)
+                return
+            try:
+                if isinstance(value, (int, float)):
+                    self.pv_readback.emit(key, f"{float(value):.6g}")
+                else:
+                    # numpy scalar or array
+                    v = float(value) if hasattr(value, '__float__') else str(value)[:16]
+                    self.pv_readback.emit(key, f"{v:.6g}" if isinstance(v, float) else v)
+            except Exception:
+                self.pv_readback.emit(key, str(char_value or value)[:16])
+
+        def _conn_cb(pvname=None, conn=None, **_kw):
+            if not conn:
+                self.pv_readback.emit(key, "n/c")
+            elif key in _string_keys:
+                self._string_refresh.emit(key)
+
+        import epics as _epics
+        try:
+            pv = _epics.PV(actual, callback=_value_cb,
+                           connection_callback=_conn_cb, auto_monitor=True)
+            self._monitored_pvs[key] = pv
+        except Exception:
+            self.pv_readback.emit(key, "err")
+
+    def _schedule_resubscribe(self, key: str):
+        """Debounce PV name edits: wait 1 s of inactivity before re-subscribing."""
+        if not EPICS_AVAILABLE or self.sim_check.isChecked():
+            return
+        t = self._resubscribe_timers.get(key)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(lambda k=key: self._subscribe_pv(k))
+            self._resubscribe_timers[key] = t
+        t.start(1000)
+
+    def _on_string_refresh(self, key: str):
+        pv = self._monitored_pvs.get(key)
+        if pv is None:
+            return
+        try:
+            val = pv.get(as_string=True)
+            if val is not None:
+                self.pv_readback.emit(key, str(val)[:16])
+        except Exception:
+            pass
+
+    def _on_pv_readback(self, key: str, value: str):
+        lbl = self._pv_value_labels.get(key)
+        if lbl is None:
+            return
+        if value in ("—", "n/c", "err"):
+            lbl.setStyleSheet(self._rbk_style("err" if value == "err" else "dim"))
+        else:
+            lbl.setStyleSheet(self._rbk_style("ok"))
+        lbl.setText(value)
 
     def _test_epics(self):
         if not EPICS_AVAILABLE:
@@ -1408,55 +2006,113 @@ class EnergyTableTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._data = [dict(r) for r in DEFAULT_LOOKUP]
+        self._data     = [dict(r) for r in DEFAULT_LOOKUP]
         self._selected = None
+        self._records  = []
         self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(12)
+        lay.setSpacing(0)
 
-        # Toolbar
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+
+        # ── Top: energy table ──
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 8)
+        top_lay.setSpacing(8)
+
         bar = QHBoxLayout()
         add_btn    = styled_button("+ Add Row")
         del_btn    = styled_button("Remove Row")
         imp_btn    = styled_button("Import CSV…")
         exp_btn    = styled_button("Export CSV…")
+        sort_lbl   = QLabel("Sort by:")
+        sort_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Mono E (keV)", "Undulator E (keV)", "Harmonic", "Roll", "Pitch"])
+        self._sort_combo.setFixedWidth(140)
+        sort_btn = styled_button("↑ Sort")
+        sort_btn.setFixedWidth(60)
         for b in [add_btn, del_btn, imp_btn, exp_btn]:
             bar.addWidget(b)
+        bar.addSpacing(12)
+        bar.addWidget(sort_lbl)
+        bar.addWidget(self._sort_combo)
+        bar.addWidget(sort_btn)
         bar.addStretch()
         self.sel_label = QLabel("No row selected")
         self.sel_label.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
         bar.addWidget(self.sel_label)
-        lay.addLayout(bar)
+        top_lay.addLayout(bar)
 
-        # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Mono E (keV)", "Undulator E (keV)", "Harmonic", "Roll", "Pitch"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            "Mono E (keV)", "Undulator E (keV)", "Harmonic", "Roll", "Pitch",
+            "BPM Sen", "IC Sen Unit", "IC Sen Num",
+        ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_select)
         self.table.cellChanged.connect(self._on_cell_changed)
-        lay.addWidget(self.table)
+        top_lay.addWidget(self.table)
 
         add_btn.clicked.connect(self._add_row)
         del_btn.clicked.connect(self._del_row)
         imp_btn.clicked.connect(self._import_csv)
         exp_btn.clicked.connect(self._export_csv)
+        sort_btn.clicked.connect(self._sort_rows)
 
         self._refresh_table()
+        splitter.addWidget(top)
 
-    _COLS = ["mono_e", "ue", "harmonic", "roll", "pitch"]
+        # ── Bottom: lookup table ──
+        bot_box = QGroupBox("Lookup Table")
+        bot_lay = QVBoxLayout(bot_box)
+
+        lk_bar = QHBoxLayout()
+        lk_imp_btn  = styled_button("Import CSV…")
+        lk_exp_btn  = styled_button("Export CSV…")
+        lk_del_btn  = styled_button("Remove Row")
+        lk_clr_btn  = styled_button("Clear All")
+        for b in [lk_imp_btn, lk_exp_btn, lk_del_btn, lk_clr_btn]:
+            lk_bar.addWidget(b)
+        lk_bar.addStretch()
+        bot_lay.addLayout(lk_bar)
+
+        self._lookup_table = QTableWidget()
+        self._lookup_table.setAlternatingRowColors(True)
+        self._lookup_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._lookup_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        bot_lay.addWidget(self._lookup_table)
+
+        lk_imp_btn.clicked.connect(self._import_lookup_csv)
+        lk_exp_btn.clicked.connect(self._export_lookup_csv)
+        lk_del_btn.clicked.connect(self._del_record_row)
+        lk_clr_btn.clicked.connect(self._clear_records)
+
+        self._refresh_lookup_table()
+        splitter.addWidget(bot_box)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        lay.addWidget(splitter)
+
+    _COLS = ["mono_e", "ue", "harmonic", "roll", "pitch", "bpm_sen", "ic_sen_unit", "ic_sen_num"]
+    _SORT_KEYS = ["mono_e", "ue", "harmonic", "roll", "pitch"]
 
     def _refresh_table(self):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self._data))
         for r, row in enumerate(self._data):
             for c, key in enumerate(self._COLS):
-                item = QTableWidgetItem(str(row[key]))
+                val = row.get(key, "")
+                item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
@@ -1466,12 +2122,23 @@ class EnergyTableTab(QWidget):
             return
         key = self._COLS[c]
         text = self.table.item(r, c).text()
+        if key in ("bpm_sen", "ic_sen_unit", "ic_sen_num"):
+            self._data[r][key] = text
+            self.changed.emit()
+            return
         try:
             val = int(text) if key == "harmonic" else float(text)
             self._data[r][key] = val
             self.changed.emit()
         except ValueError:
             pass
+
+    def _sort_rows(self):
+        idx = self._sort_combo.currentIndex()
+        key = self._SORT_KEYS[idx] if idx < len(self._SORT_KEYS) else "mono_e"
+        self._data.sort(key=lambda r: r.get(key, 0))
+        self._refresh_table()
+        self.changed.emit()
 
     def _on_select(self):
         rows = self.table.selectedItems()
@@ -1488,7 +2155,12 @@ class EnergyTableTab(QWidget):
         self.row_selected.emit(self._selected)
 
     def _add_row(self):
-        self._data.append({"mono_e": 0.0, "ue": 0.0, "harmonic": 1, "roll": 0.0, "pitch": 0.0})
+        if self._data:
+            new_row = dict(self._data[-1])
+        else:
+            new_row = {"mono_e": 0.0, "ue": 0.0, "harmonic": 1, "roll": 0.0, "pitch": 0.0,
+                       "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"}
+        self._data.append(new_row)
         self._refresh_table()
         self.table.selectRow(len(self._data) - 1)
         self.changed.emit()
@@ -1512,11 +2184,14 @@ class EnergyTableTab(QWidget):
                 try:
                     mono_e = float(row.get("mono_e", 0))
                     self._data.append({
-                        "mono_e":   mono_e,
-                        "ue":       float(row.get("ue", 0)),
-                        "harmonic": int(row["harmonic"]) if "harmonic" in row else calc_harmonic(mono_e),
-                        "roll":     float(row.get("roll", 0)),
-                        "pitch":    float(row.get("pitch", 0)),
+                        "mono_e":      mono_e,
+                        "ue":          float(row.get("ue", 0)),
+                        "harmonic":    int(row["harmonic"]) if "harmonic" in row else calc_harmonic(mono_e),
+                        "roll":        float(row.get("roll", 0)),
+                        "pitch":       float(row.get("pitch", 0)),
+                        "bpm_sen":     str(row.get("bpm_sen", "1")),
+                        "ic_sen_unit": str(row.get("ic_sen_unit", "2")),
+                        "ic_sen_num":  str(row.get("ic_sen_num", "2")),
                     })
                 except (ValueError, KeyError):
                     pass
@@ -1524,11 +2199,12 @@ class EnergyTableTab(QWidget):
         self.changed.emit()
 
     def _export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "lookup_table.csv", "CSV files (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Energy Table CSV", "energy_table.csv", "CSV files (*.csv)")
         if not path:
             return
         with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["mono_e", "ue", "harmonic", "roll", "pitch"])
+            writer = csv.DictWriter(f, fieldnames=["mono_e", "ue", "harmonic", "roll", "pitch",
+                                                    "bpm_sen", "ic_sen_unit", "ic_sen_num"])
             writer.writeheader()
             writer.writerows(self._data)
 
@@ -1542,38 +2218,126 @@ class EnergyTableTab(QWidget):
         self._data = [dict(r) for r in data]
         self._refresh_table()
 
+    # ── Lookup table (record of past alignments) ──
+
+    def _refresh_lookup_table(self):
+        all_keys = list(dict.fromkeys(k for row in self._records for k in row))
+        # ensure Timestamp is always first
+        if "Timestamp" in all_keys:
+            all_keys.remove("Timestamp")
+            all_keys.insert(0, "Timestamp")
+        self._lookup_table.blockSignals(True)
+        self._lookup_table.setColumnCount(len(all_keys))
+        self._lookup_table.setHorizontalHeaderLabels(all_keys)
+        self._lookup_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._lookup_table.setRowCount(len(self._records))
+        for r, row in enumerate(self._records):
+            for c, lbl in enumerate(all_keys):
+                item = QTableWidgetItem(str(row.get(lbl, "")))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._lookup_table.setItem(r, c, item)
+        self._lookup_table.blockSignals(False)
+
+    def append_record_row(self, values: dict):
+        self._records.append(dict(values))
+        self._refresh_lookup_table()
+        self.changed.emit()
+
+    def _del_record_row(self):
+        r = self._lookup_table.currentRow()
+        if r < 0:
+            return
+        self._records.pop(r)
+        self._refresh_lookup_table()
+        self.changed.emit()
+
+    def _clear_records(self):
+        reply = QMessageBox.question(self, "Clear Lookup Table",
+                                     "Remove all rows from the lookup table?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._records.clear()
+            self._refresh_lookup_table()
+            self.changed.emit()
+
+    def _import_lookup_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Lookup CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                self._records.append(dict(row))
+        self._refresh_lookup_table()
+        self.changed.emit()
+
+    def _export_lookup_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Lookup CSV", "lookup_table.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        all_keys = list(dict.fromkeys(k for row in self._records for k in row))
+        if "Timestamp" in all_keys:
+            all_keys.remove("Timestamp")
+            all_keys.insert(0, "Timestamp")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
+            writer.writeheader()
+            for row in self._records:
+                writer.writerow({k: row.get(k, "") for k in all_keys})
+
+    def get_record_data(self):
+        return [dict(r) for r in self._records]
+
+    def set_record_data(self, data):
+        self._records = [dict(r) for r in data]
+        self._refresh_lookup_table()
+
 
 # ─── Motor → scan plot mapping ────────────────────────────────────────────────
 # Plot A: position/zero-crossing scans. Plot B: intensity peak scans.
 _SCAN_PLOT_A = {
     "roll":         ("Roll Scan",              "BPM X (mm)",      "Roll position"),
     "mir_slit_cen": ("Slit Scan  4A",          "Signal",          "Slit center (mm)"),
-    "mir_piezo":    ("Mirror Piezo  4B",        "BPM Y (mm)",      "Piezo position"),
+    "mir_piezo":    ("Mirror Piezo Pitch  4C",   "BPM Y (mm)",      "Piezo position"),
 }
 _SCAN_PLOT_B = {
     "pitch":        ("Pitch Scan",             "Intensity (a.u.)", "Pitch position"),
-    "mir_vdm":      ("VDM Scan  4C",           "Signal",          "VDM:Y"),
-    "mir_coupled":  ("VFM+VDM Scan  4D",       "Signal",          "VFM:Y"),
+    "mir_vdm":      ("VDM Scan  4D",           "Signal",          "VDM:Y"),
+    "mir_coupled":  ("VFM+VDM Scan  4E",       "Signal",          "VFM:Y"),
 }
 
 # ─── Alignment Tab ────────────────────────────────────────────────────────────
 class AlignmentTab(QWidget):
+    alignment_done = pyqtSignal(bool)   # emitted after worker finishes; True = success
+
     _SUBSTEP_TEXT = {
-        "3_3a": "Set piezos to center",
-        "3_3b": "Roll scan → BPM x = 0",
-        "3_3c": "Pitch scan → intensity peak",
+        "1_1a": "Read Energy table",
+        "2_2a": "Turn off BPM feedback",
+        "2_2b": "Apply Energy table settings",
+        "2_2c": "Mirror out",
+        "3_3a": "Puts DCM Piezo at 5",
+        "3_3b": "Pitch scan → intensity peak",
+        "3_3c": "Roll scan → BPM x = 0",
+        "3_3d": "Pitch scan → intensity peak",
         "4_4A": "Slit scan → beam center",
-        "4_4B": "Mirror in + piezo → BPMY = 0",
-        "4_4C": "Scan VDM:Y → peak",
-        "4_4D": "Coupled VFM+VDM → peak",
+        "4_4B": "Mirror in",
+        "4_4C": "Mirror piezo pitch scan → BPM y = 0",
+        "4_4D": "VDM:Y scan → peak",
+        "4_4E": "Coupled VFM:Y+VDM:Y → peak",
+        "5_5mir": "Mirror in",
+        "5_5a": "Turn on H feedback",
+        "5_5b": "DCM piezo pitch scan → max intensity",
+        "5_5c": "Mirror piezo pitch scan → BPM y = 0",
+        "5_5d": "Turn on V feedback",
     }
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._selected_row = None
-        self._worker = None
-        self._thread = None
+        self._selected_row     = None
+        self._worker           = None
+        self._thread           = None
+        self._last_scan_results = {}
         self._build()
+        self._on_skip_mirror_changed()
 
     @staticmethod
     def _badge_style(color):
@@ -1600,19 +2364,36 @@ class AlignmentTab(QWidget):
         ctrl_l = QVBoxLayout(ctrl_box)
         ctrl_l.setSpacing(6)
         btn_row = QHBoxLayout()
-        self.start_btn = styled_button("▶  Start Alignment", "primary", 150)
-        self.abort_btn = styled_button("■  Abort", "danger", 80)
+        btn_row.setSpacing(8)
+        self.start_btn = QPushButton("▶  Start Alignment")
+        self.start_btn.setFixedWidth(160)
+        self.abort_btn = QPushButton("■  Abort")
+        self.abort_btn.setFixedWidth(80)
         self.abort_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.abort_btn)
         btn_row.addStretch()
         ctrl_l.addLayout(btn_row)
+        self._refresh_start_btn()
+        self._refresh_abort_btn()
         self.skip_mirror_chk = QCheckBox("Skip mirror alignment (Step 4)")
         self.skip_mirror_chk.setChecked(True)
         self.skip_mirror_chk.setToolTip(
             "When checked, Step 4 is bypassed; mirror is inserted before Step 5"
         )
+        self.skip_mirror_chk.stateChanged.connect(self._on_skip_mirror_changed)
         ctrl_l.addWidget(self.skip_mirror_chk)
+        self.confirm_chk = QCheckBox("Confirm each step")
+        self.confirm_chk.setChecked(False)
+        self.confirm_chk.setToolTip(
+            "When checked, alignment pauses after each scan substep for operator review"
+        )
+        ctrl_l.addWidget(self.confirm_chk)
+        self.proceed_btn = QPushButton("▶  Proceed")
+        self.proceed_btn.setFixedWidth(120)
+        self.proceed_btn.setVisible(False)
+        self.proceed_btn.clicked.connect(self._proceed_clicked)
+        ctrl_l.addWidget(self.proceed_btn)
         self.progress = QProgressBar()
         self.progress.setRange(0, 5)
         self.progress.setValue(0)
@@ -1643,18 +2424,29 @@ class AlignmentTab(QWidget):
         self._substep_labels = {}   # "step_substep" → QLabel
 
         step_defs = [
-            (1, "Load Lookup Table Settings", []),
-            (2, "Disable BPM → Motors → Mirror Out", []),
+            (1, "Load Energy Table Settings",
+             [("1a", "Read Energy table")]),
+            (2, "Apply Energy Table Settings",
+             [("2a", "Turn off BPM feedback"),
+              ("2b", "Apply Energy table settings"),
+              ("2c", "Mirror out")]),
             (3, "DCM Piezo Alignment",
-             [("3a", "Set piezos to center"),
-              ("3b", "Roll scan → BPM x = 0"),
-              ("3c", "Pitch scan → intensity peak")]),
+             [("3a", "Puts DCM Piezo at 5"),
+              ("3b", "Pitch scan → intensity peak"),
+              ("3c", "Roll scan → BPM x = 0"),
+              ("3d", "Pitch scan → intensity peak")]),
             (4, "Mirror Alignment",
              [("4A", "Slit scan → beam center"),
-              ("4B", "Mirror in + piezo → BPMY = 0"),
-              ("4C", "Scan VDM:Y → peak"),
-              ("4D", "Coupled VFM+VDM → peak")]),
-            (5, "Enable Feedback Loops", []),
+              ("4B", "Mirror in"),
+              ("4C", "Mirror piezo pitch scan → BPM y = 0"),
+              ("4D", "VDM:Y scan → peak"),
+              ("4E", "Coupled VFM:Y+VDM:Y → peak")]),
+            (5, "Enable Feedback Loops",
+             [("5mir", "Mirror in"),
+              ("5a", "Turn on H feedback"),
+              ("5b", "DCM piezo pitch scan → max intensity"),
+              ("5c", "Mirror piezo pitch scan → BPM y = 0"),
+              ("5d", "Turn on V feedback")]),
         ]
 
         for step_num, title, substeps in step_defs:
@@ -1679,7 +2471,7 @@ class AlignmentTab(QWidget):
             steps_lay.addWidget(step_w)
 
             for sub_id, sub_txt in substeps:
-                sub_lbl = QLabel(f"    ○  {sub_txt}")
+                sub_lbl = QLabel(f"    ○  {sub_id.upper()}: {sub_txt}")
                 sub_lbl.setStyleSheet(
                     f"color: {PAL['text_dim']}; font-size: 11px;"
                 )
@@ -1687,6 +2479,10 @@ class AlignmentTab(QWidget):
                 steps_lay.addWidget(sub_lbl)
 
         steps_lay.addStretch()
+
+        # Visibility is set by _on_skip_mirror_changed() called after _build()
+        self._substep_labels["5_5mir"].setVisible(False)
+
         step_scroll.setWidget(steps_inner)
         left_lay.addWidget(step_scroll, 1)
         main_lay.addWidget(left)
@@ -1794,16 +2590,28 @@ class AlignmentTab(QWidget):
         else:
             info["widget"].setStyleSheet("background: transparent; border-radius: 4px;")
 
+    def _on_skip_mirror_changed(self, _=None):
+        skip = self.skip_mirror_chk.isChecked()
+        lbl = self._substep_labels.get("5_5mir")
+        if lbl:
+            lbl.setVisible(skip)
+
     def _set_substep(self, key, status, detail=""):
         lbl = self._substep_labels.get(key)
         if not lbl:
             return
-        base = self._SUBSTEP_TEXT.get(key, key)
+        sub_id = (key.split("_", 1)[1] if "_" in key else key).upper()
+        base = f"{sub_id}: {self._SUBSTEP_TEXT.get(key, key)}"
         suffix = f" ({detail})" if detail else ""
         if status == "running":
             lbl.setText(f"    ⟳  {base}")
             lbl.setStyleSheet(
                 f"color: {PAL['amber']}; font-size: 11px; font-weight: 600;"
+            )
+        elif status == "waiting":
+            lbl.setText(f"    ⏸  {base}{suffix}")
+            lbl.setStyleSheet(
+                f"color: {PAL['amber']}; font-size: 11px; font-style: italic;"
             )
         elif status == "done":
             lbl.setText(f"    ✓  {base}{suffix}")
@@ -1835,6 +2643,44 @@ class AlignmentTab(QWidget):
 
     # ── Public ────────────────────────────────────────────────────────────────
 
+    def _refresh_abort_btn(self):
+        self.abort_btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background: {PAL['bg']};"
+            f"  color: {PAL['red']};"
+            f"  border: 2px solid {PAL['red']};"
+            f"  border-radius: 5px;"
+            f"  padding: 6px 16px;"
+            f"  font-weight: 600;"
+            f"  font-size: 12px;"
+            f"}}"
+            f"QPushButton:hover {{ background: {PAL['tag_red_bg']}; }}"
+            f"QPushButton:disabled {{"
+            f"  background: {PAL['surface']};"
+            f"  color: {PAL['border']};"
+            f"  border-color: {PAL['surface_hi']};"
+            f"}}"
+        )
+
+    def _refresh_start_btn(self):
+        self.start_btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background: {PAL['cyan_dim']};"
+            f"  color: {PAL['text_pri']};"
+            f"  border: 2px solid {PAL['cyan']};"
+            f"  border-radius: 5px;"
+            f"  padding: 7px 20px;"
+            f"  font-size: 13px;"
+            f"  font-weight: 700;"
+            f"}}"
+            f"QPushButton:hover {{ background: {PAL['cyan']}; color: {PAL['text_pri']}; }}"
+            f"QPushButton:disabled {{"
+            f"  background: {PAL['surface_hi']};"
+            f"  color: {PAL['text_dim']};"
+            f"  border-color: {PAL['border']};"
+            f"}}"
+        )
+
     def set_selected_row(self, row):
         self._selected_row = row
         self.row_label.setText(
@@ -1865,6 +2711,7 @@ class AlignmentTab(QWidget):
             simulate=simulate,
             skip_mirror=self.skip_mirror_chk.isChecked(),
             mirror_stages=mirror_stages,
+            confirm_mode=self.confirm_chk.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1874,7 +2721,9 @@ class AlignmentTab(QWidget):
         self._worker.scan_peak.connect(self._on_scan_peak)
         self._worker.bpm_update.connect(self._on_bpm_update)
         self._worker.feedback_update.connect(self._on_feedback)
-        self._worker.mir_substep.connect(self._on_mir_substep)
+        self._worker.substep_status.connect(self._set_substep)
+        self._worker.confirm_needed.connect(self._on_confirm_needed)
+        self._worker.scan_results_ready.connect(self._on_scan_results)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
@@ -1895,28 +2744,17 @@ class AlignmentTab(QWidget):
             if info["tag"].text() == "Done"
         )
         self.progress.setValue(done)
-        if step == 3 and status == "running":
-            self._set_substep("3_3a", "done")
-            self._set_substep("3_3b", "done")
 
     def _on_scan_point(self, motor, x, y):
         if motor in _SCAN_PLOT_A:
             if self._pa_motor != motor:
                 self._start_scan("A", motor)
-                sub = {"roll": "3_3b", "mir_slit_cen": "4_4A",
-                       "mir_piezo": "4_4B"}.get(motor)
-                if sub:
-                    self._set_substep(sub, "running")
             self._pa_xs.append(x); self._pa_ys.append(y)
             self._pa_curve.setData(self._pa_xs, self._pa_ys)
             self._pa_scatter.setData(self._pa_xs, self._pa_ys)
         elif motor in _SCAN_PLOT_B:
             if self._pb_motor != motor:
                 self._start_scan("B", motor)
-                sub = {"pitch": "3_3c", "mir_vdm": "4_4C",
-                       "mir_coupled": "4_4D"}.get(motor)
-                if sub:
-                    self._set_substep(sub, "running")
             self._pb_xs.append(x); self._pb_ys.append(y)
             self._pb_curve.setData(self._pb_xs, self._pb_ys)
             self._pb_scatter.setData(self._pb_xs, self._pb_ys)
@@ -1925,17 +2763,9 @@ class AlignmentTab(QWidget):
         if motor in _SCAN_PLOT_A:
             self._pa_peak.setValue(peak)
             self._pa_peak.setVisible(True)
-            sub = {"roll": "3_3b", "mir_slit_cen": "4_4A",
-                   "mir_piezo": "4_4B"}.get(motor)
-            if sub:
-                self._set_substep(sub, "done", f"{peak:.5f}")
         elif motor in _SCAN_PLOT_B:
             self._pb_peak.setValue(peak)
             self._pb_peak.setVisible(True)
-            sub = {"pitch": "3_3c", "mir_vdm": "4_4C",
-                   "mir_coupled": "4_4D"}.get(motor)
-            if sub:
-                self._set_substep(sub, "done", f"{peak:.3f}")
 
     def _on_bpm_update(self, x, y, intensity):
         self._bpm_x_lbl.setText(f"{x:+.4f}")
@@ -1956,15 +2786,28 @@ class AlignmentTab(QWidget):
         self._set_tag(self._fb_h, f"H FB  {'ON' if h else 'OFF'}", "green" if h else "grey")
         self._set_tag(self._fb_v, f"V FB  {'ON' if v else 'OFF'}", "green" if v else "grey")
 
-    def _on_mir_substep(self, step_id, status):
-        self._set_substep(f"4_{step_id}", status)
+    def _on_scan_results(self, results: dict):
+        self._last_scan_results = results
+
+    def _on_confirm_needed(self, substep_key):
+        self.proceed_btn.setVisible(True)
+        self.proceed_btn.setEnabled(True)
+        self.log.append_log(f"  ⏸  Waiting for operator confirmation after {substep_key} — click Proceed to continue", "warn")
+
+    def _proceed_clicked(self):
+        self.proceed_btn.setEnabled(False)
+        self.proceed_btn.setVisible(False)
+        if self._worker:
+            self._worker.confirm()
 
     def _on_finished(self, success):
         self.start_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
+        self.proceed_btn.setVisible(False)
         if self._thread:
             self._thread.quit()
             self._thread.wait()
+        self.alignment_done.emit(success)
 
     def _reset_ui(self):
         for step_num in self._step_row_info:
@@ -1994,8 +2837,12 @@ class MirrorTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mirror_stages = [dict(s) for s in DEFAULT_MIRROR_STAGES]
-        self._scan_fields = {}
+        self._scan_fields   = {}
+        self._is_simulate   = lambda: False
         self._build()
+
+    def set_simulate_fn(self, fn):
+        self._is_simulate = fn
 
     def _build(self):
         scroll = QScrollArea()
@@ -2009,8 +2856,8 @@ class MirrorTab(QWidget):
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
 
-        # ── Mirror Scan Parameters ──
-        scan_box = QGroupBox("Mirror Scan Parameters")
+        # ── Mirror Alignment Parameters ──
+        scan_box = QGroupBox("Mirror Alignment Parameters")
         scan_lay = QGridLayout(scan_box)
         scan_lay.setSpacing(8)
         scan_lay.addWidget(QLabel("Signal source"), 0, 0)
@@ -2025,23 +2872,24 @@ class MirrorTab(QWidget):
             ("mir_slit_cen_start", "Slit scan start (mm)",  QDoubleSpinBox, -20.0,  0.0,  -2.0,  2),
             ("mir_slit_cen_stop",  "Slit scan stop (mm)",   QDoubleSpinBox,  0.0,  20.0,   2.0,  2),
             ("mir_slit_cen_steps", "Slit scan steps",       QSpinBox,        3,    200,    21,   0),
-            ("mir_slit_size_b",    "Slit size 4B (mm)",     QDoubleSpinBox,  0.01,  5.0,   0.2,  3),
+            ("mir_slit_size_b",    "Slit size 4C (mm)",     QDoubleSpinBox,  0.01,  5.0,   0.2,  3),
             ("mir_vdm_start",      "VDM scan start offset", QDoubleSpinBox, -5000., 0.,  -500.,  1),
             ("mir_vdm_stop",       "VDM scan stop offset",  QDoubleSpinBox,  0., 5000.,   500.,  1),
             ("mir_vdm_steps",      "VDM scan steps",        QSpinBox,        3,    200,    21,   0),
             ("mir_vfm_start",      "VFM scan start offset", QDoubleSpinBox, -5000., 0.,  -250.,  1),
             ("mir_vfm_stop",       "VFM scan stop offset",  QDoubleSpinBox,  0., 5000.,   250.,  1),
             ("mir_vfm_steps",      "VFM scan steps",        QSpinBox,        3,    200,    21,   0),
+            ("mir_slit_size_c",    "Slit size after 4E (mm)", QDoubleSpinBox, 0.01, 20.0,  2.0,  3),
         ]
         for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(mir_scan_defs, start=1):
             scan_lay.addWidget(QLabel(lbl), r, 0)
             if cls == QDoubleSpinBox:
-                sb = QDoubleSpinBox()
+                sb = NoScrollDoubleSpinBox()
                 sb.setDecimals(dec)
                 sb.setRange(mn, mx)
                 sb.setValue(dflt)
             else:
-                sb = QSpinBox()
+                sb = NoScrollSpinBox()
                 sb.setRange(int(mn), int(mx))
                 sb.setValue(int(dflt))
             sb.setMinimumWidth(100)
@@ -2054,12 +2902,11 @@ class MirrorTab(QWidget):
         proc_box = QGroupBox("Procedure Overview")
         proc_l = QVBoxLayout(proc_box)
         proc_lbl = QLabel(
-            "<b>4A</b> Slit scan (mirror out): scan slit center → signal peak → move.<br>"
-            "<b>4B</b> Mirror in, BPMY centering: insert mirror → narrow slit → scan mirror "
-            "pitch piezo → BPMY = 0.<br>"
-            "<b>4C</b> VDM:Y scan: scan VDM:Y → signal peak → move.<br>"
-            "<b>4D</b> Coupled VFM+VDM: scan VFM:Y (VDM step = 2× VFM step) → move VFM to "
-            "peak; move VDM by 2× VFM delta."
+            "<b>4A</b> Slit scan (mirror out): scan slit center → signal peak → center slit.<br>"
+            "<b>4B</b> Mirror in: insert all mirror stages into beam path.<br>"
+            "<b>4C</b> Mirror piezo pitch scan: narrow slit → scan mirror pitch piezo → BPM y = 0.<br>"
+            "<b>4D</b> VDM:Y scan: scan VDM:Y → signal peak → move.<br>"
+            "<b>4E</b> Coupled VFM+VDM scan: scan VFM:Y with VDM step = 2× VFM step → move both to peak."
         )
         proc_lbl.setWordWrap(True)
         proc_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -2139,68 +2986,74 @@ class MirrorTab(QWidget):
         self.changed.emit()
 
     def _test_stage_pvs(self):
-        if not EPICS_AVAILABLE:
-            QMessageBox.warning(self, "Test PVs", "pyepics is not installed.")
-            return
-        import epics
-        timeout = 2.0
-        results = {}
+        simulate = self._is_simulate()
+        stages   = list(self._mirror_stages)
+        results  = [None] * len(stages)
 
-        def _check(i, stage):
-            pv_name = stage["pv"].strip()
-            if not pv_name:
-                results[i] = (stage["name"], pv_name, "skipped")
-                return
+        def test_one(stage):
+            name, pv = stage["name"], stage["pv"].strip()
+            if not pv:
+                return (name, "—", "— (no PV)")
+            if simulate:
+                return (name, pv, "sim")
+            if not EPICS_AVAILABLE:
+                return (name, pv, "no EPICS")
             try:
-                pv = epics.PV(pv_name, connection_timeout=timeout)
-                connected = pv.wait_for_connection(timeout=timeout)
-                if connected:
-                    pv.disconnect()
-                results[i] = (stage["name"], pv_name, "ok" if connected else "timeout")
-            except Exception as e:
-                msg = str(e)
-                results[i] = (stage["name"], pv_name,
-                              "timeout" if "access violation" in msg.lower() else f"error: {msg}")
+                import epics as _epics
+                val = _epics.caget(pv, timeout=2.0)
+                if val is None:
+                    return (name, pv, "✗  timeout / not found")
+                return (name, pv, f"✓  {val}")
+            except Exception as exc:
+                return (name, pv, f"✗  {exc}")
 
-        threads = [threading.Thread(target=_check, args=(i, s))
-                   for i, s in enumerate(self._mirror_stages)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            n = max(len(stages), 1)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+                future_map = {ex.submit(test_one, s): i for i, s in enumerate(stages)}
+                pending    = set(future_map)
+                while pending:
+                    done, pending = concurrent.futures.wait(pending, timeout=0.05)
+                    QApplication.processEvents()
+                    for f in done:
+                        results[future_map[f]] = f.result()
+        finally:
+            QApplication.restoreOverrideCursor()
 
-        rows = ""
-        for i in sorted(results):
-            name, pv_name, status = results[i]
-            icon, color = (("✓", PAL["green"]) if status == "ok"
-                           else ("—", PAL["text_dim"]) if status == "skipped"
-                           else ("✗", PAL["red"]))
-            rows += (
-                f'<tr>'
-                f'<td style="padding:3px 8px;color:{PAL["text_sec"]}">{name}</td>'
-                f'<td style="padding:3px 8px;font-family:monospace;color:{PAL["text_dim"]}">'
-                f'{pv_name or "(empty)"}</td>'
-                f'<td style="padding:3px 8px;color:{color};font-weight:600">'
-                f'{icon} {status}</td>'
-                f'</tr>'
-            )
-        n_ok = sum(1 for _, _, s in results.values() if s == "ok")
-        n_total = sum(1 for _, _, s in results.values() if s != "skipped")
         dlg = QDialog(self)
         dlg.setWindowTitle("Mirror Stage PV Test")
-        dlg.setMinimumWidth(500)
-        dlg_l = QVBoxLayout(dlg)
-        summary = QLabel(f"<b>{n_ok} / {n_total} mirror stage PVs connected</b>")
-        summary.setStyleSheet(
-            f"font-size:13px; color:{PAL['green'] if n_ok == n_total else PAL['amber']};"
-        )
-        dlg_l.addWidget(summary)
-        text = QLabel(f'<table cellspacing="0">{rows}</table>')
-        text.setTextFormat(Qt.TextFormat.RichText)
-        dlg_l.addWidget(text)
-        close_btn = styled_button("Close")
-        close_btn.clicked.connect(dlg.accept)
-        dlg_l.addWidget(close_btn)
+        dlg.resize(700, 380)
+        lay = QVBoxLayout(dlg)
+
+        tbl = QTableWidget(len(results), 3)
+        tbl.setHorizontalHeaderLabels(["Stage Name", "PV Name", "Current Value / Status"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+
+        ok_color  = QColor("#2e7d32")
+        err_color = QColor("#b71c1c")
+        dim_color = QColor("#888888")
+
+        for r, (name, pv, status) in enumerate(results):
+            tbl.setItem(r, 0, QTableWidgetItem(name))
+            tbl.setItem(r, 1, QTableWidgetItem(pv))
+            st_item = QTableWidgetItem(status)
+            if status.startswith("✓"):
+                st_item.setForeground(ok_color)
+            elif status.startswith("✗"):
+                st_item.setForeground(err_color)
+            else:
+                st_item.setForeground(dim_color)
+            tbl.setItem(r, 2, st_item)
+
+        lay.addWidget(tbl)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
         dlg.exec()
 
     def get_mirror_stages(self):
@@ -2237,7 +3090,214 @@ class MirrorTab(QWidget):
 
 
 # ─── Main Window ─────────────────────────────────────────────────────────────
+class RecordTab(QWidget):
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pv_config   = [dict(r) for r in DEFAULT_RECORD_PVS]
+        self._is_simulate = lambda: False
+        self._build()
+
+    def set_simulate_fn(self, fn):
+        self._is_simulate = fn
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        # ── PV config ──
+        pv_box = QGroupBox("PVs to Record")
+        pv_lay = QVBoxLayout(pv_box)
+
+        pv_bar = QHBoxLayout()
+        add_pv_btn  = styled_button("+ Add PV")
+        del_pv_btn  = styled_button("Remove PV")
+        test_pv_btn = styled_button("Test PVs")
+        all_btn     = styled_button("Include All")
+        pv_bar.addWidget(add_pv_btn)
+        pv_bar.addWidget(del_pv_btn)
+        pv_bar.addWidget(test_pv_btn)
+        pv_bar.addWidget(all_btn)
+        pv_bar.addStretch()
+        pv_bar.addWidget(QLabel("☑ = include in next save   |   timestamp is always recorded"))
+        pv_lay.addLayout(pv_bar)
+
+        self._pv_table = QTableWidget()
+        self._pv_table.setColumnCount(3)
+        self._pv_table.setHorizontalHeaderLabels(["Include", "Label", "PV Name"])
+        self._pv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._pv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._pv_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._pv_table.setAlternatingRowColors(True)
+        pv_lay.addWidget(self._pv_table)
+        lay.addWidget(pv_box, 1)
+
+        add_pv_btn.clicked.connect(self._add_pv)
+        del_pv_btn.clicked.connect(self._del_pv)
+        test_pv_btn.clicked.connect(self._test_pvs)
+        all_btn.clicked.connect(self._include_all)
+        self._pv_table.cellChanged.connect(self._on_pv_cell_changed)
+        self._pv_table.itemChanged.connect(self._on_pv_item_changed)
+
+        self._refresh_pv_table()
+
+    def _refresh_pv_table(self):
+        self._pv_table.blockSignals(True)
+        self._pv_table.setRowCount(len(self._pv_config))
+        for r, entry in enumerate(self._pv_config):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Checked if entry["checked"] else Qt.CheckState.Unchecked)
+            chk.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._pv_table.setItem(r, 0, chk)
+            lbl_item = QTableWidgetItem(entry["label"])
+            if entry.get("locked", False):
+                lbl_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                lbl_item.setToolTip("Label is locked to preserve CSV compatibility")
+            self._pv_table.setItem(r, 1, lbl_item)
+            self._pv_table.setItem(r, 2, QTableWidgetItem(entry["pv"]))
+        self._pv_table.blockSignals(False)
+
+    def _on_pv_item_changed(self, item):
+        if item.column() != 0:
+            return
+        r = item.row()
+        if r >= len(self._pv_config):
+            return
+        self._pv_config[r]["checked"] = (item.checkState() == Qt.CheckState.Checked)
+        self.changed.emit()
+
+    def _on_pv_cell_changed(self, r, c):
+        if c == 0 or r >= len(self._pv_config):
+            return
+        text = self._pv_table.item(r, c).text()
+        if c == 1:
+            if self._pv_config[r].get("locked", False):
+                return
+            self._pv_config[r]["label"] = text
+        elif c == 2:
+            self._pv_config[r]["pv"] = text
+        self.changed.emit()
+
+    def _include_all(self):
+        for entry in self._pv_config:
+            entry["checked"] = True
+        self._refresh_pv_table()
+        self.changed.emit()
+
+    def _add_pv(self):
+        self._pv_config.append({"label": "New PV", "pv": "", "checked": False, "locked": False})
+        self._refresh_pv_table()
+        self.changed.emit()
+
+    def _del_pv(self):
+        r = self._pv_table.currentRow()
+        if r < 0:
+            return
+        self._pv_config.pop(r)
+        self._refresh_pv_table()
+        self.changed.emit()
+
+    def _test_pvs(self):
+        simulate = self._is_simulate()
+        entries  = list(self._pv_config)
+        results  = [None] * len(entries)
+
+        def test_one(entry):
+            label, pv = entry["label"], entry["pv"]
+            if entry.get("source") == "scan_result":
+                return (label, "—", "— (computed after alignment)")
+            if not pv:
+                return (label, "—", "— (no PV)")
+            if simulate:
+                return (label, pv, "sim")
+            if not EPICS_AVAILABLE:
+                return (label, pv, "no EPICS")
+            _STRING_LABELS = {"BPM Sensitivity", "MonP Sensitivity Unit", "MonP Sensitivity Num"}
+            try:
+                import epics as _epics
+                if label in _STRING_LABELS:
+                    val = _epics.caget(pv, as_string=True, timeout=2.0)
+                    if val is None:
+                        return (label, pv, "✗  timeout / not found")
+                    return (label, pv, f"✓  {val}")
+                val = _epics.caget(pv, timeout=2.0)
+                if val is None:
+                    return (label, pv, "✗  timeout / not found")
+                if label == "XTAL":
+                    display = {0: "111", 1: "311"}.get(int(val), str(val))
+                    return (label, pv, f"✓  {display}")
+                return (label, pv, f"✓  {val}")
+            except Exception as exc:
+                return (label, pv, f"✗  {exc}")
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            n = max(len(entries), 1)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+                future_map = {ex.submit(test_one, e): i for i, e in enumerate(entries)}
+                pending    = set(future_map)
+                while pending:
+                    done, pending = concurrent.futures.wait(pending, timeout=0.05)
+                    QApplication.processEvents()
+                    for f in done:
+                        results[future_map[f]] = f.result()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("PV Connection Test")
+        dlg.resize(700, 400)
+        lay = QVBoxLayout(dlg)
+
+        tbl = QTableWidget(len(results), 3)
+        tbl.setHorizontalHeaderLabels(["Label", "PV Name", "Status"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+
+        ok_color  = QColor("#2e7d32")
+        err_color = QColor("#b71c1c")
+        dim_color = QColor("#888888")
+
+        for r, (label, pv, status) in enumerate(results):
+            tbl.setItem(r, 0, QTableWidgetItem(label))
+            tbl.setItem(r, 1, QTableWidgetItem(pv))
+            st_item = QTableWidgetItem(status)
+            if status.startswith("✓"):
+                st_item.setForeground(ok_color)
+            elif status.startswith("✗"):
+                st_item.setForeground(err_color)
+            else:
+                st_item.setForeground(dim_color)
+            tbl.setItem(r, 2, st_item)
+
+        lay.addWidget(tbl)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
+
+    def get_checked_pvs(self):
+        return [{"label": e["label"], "pv": e["pv"]}
+                for e in self._pv_config if e["checked"]]
+
+    def get_pv_config(self):
+        return [dict(r) for r in self._pv_config]
+
+    def set_pv_config(self, config):
+        self._pv_config = [{**r, "locked": r.get("locked", True)}
+                           for r in config if r.get("label") != "Timestamp"]
+        self._refresh_pv_table()
+
+
 class MainWindow(QMainWindow):
+    _bpm_polled = pyqtSignal(float, float, float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DCM Alignment Console")
@@ -2276,6 +3336,16 @@ class MainWindow(QMainWindow):
         epics_tag = make_tag("EPICS available" if EPICS_AVAILABLE else "Simulation mode", "green" if EPICS_AVAILABLE else "amber")
         tb_lay.addWidget(epics_tag)
 
+        theme_lbl = QLabel("Theme:")
+        theme_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItems(list(THEMES.keys()))
+        self._theme_combo.setFixedWidth(130)
+        self._theme_combo.currentTextChanged.connect(self._apply_theme)
+        tb_lay.addSpacing(12)
+        tb_lay.addWidget(theme_lbl)
+        tb_lay.addWidget(self._theme_combo)
+
         main_lay.addWidget(topbar)
 
         # ── Tabs ──
@@ -2287,11 +3357,15 @@ class MainWindow(QMainWindow):
         self.energy_tab    = EnergyTableTab()
         self.alignment_tab = AlignmentTab()
         self.mirror_tab    = MirrorTab()
+        self.record_tab    = RecordTab()
+        self.record_tab.set_simulate_fn(self.setup_tab.is_simulate)
+        self.mirror_tab.set_simulate_fn(self.setup_tab.is_simulate)
 
         self.tabs.addTab(self.setup_tab,     "  Setup  ")
         self.tabs.addTab(self.energy_tab,    "  Energy Table  ")
         self.tabs.addTab(self.alignment_tab, "  Alignment  ")
         self.tabs.addTab(self.mirror_tab,    "  Mirror  ")
+        self.tabs.addTab(self.record_tab,    "  Record  ")
 
         # Wire up row selection → alignment tab
         self.energy_tab.row_selected.connect(self.alignment_tab.set_selected_row)
@@ -2310,6 +3384,73 @@ class MainWindow(QMainWindow):
         self.setup_tab.changed.connect(self._save_config)
         self.energy_tab.changed.connect(self._save_config)
         self.mirror_tab.changed.connect(self._save_config)
+        self.record_tab.changed.connect(self._save_config)
+        self.alignment_tab.alignment_done.connect(self._on_alignment_done)
+
+        # Continuous BPM monitor via EPICS CA subscriptions
+        self._bpm_monitored = {}  # "bpm_x"/"bpm_y"/"bpm_intensity" → epics.PV
+        self._bpm_vals      = {"bpm_x": 0.0, "bpm_y": 0.0, "bpm_intensity": 0.0}
+        self._bpm_polled.connect(self.alignment_tab._on_bpm_update)
+        self.setup_tab.sim_check.toggled.connect(self._on_sim_toggled_bpm)
+        # Re-subscribe when PV names change
+        self.setup_tab.changed.connect(self._refresh_bpm_monitors)
+        if EPICS_AVAILABLE and not self.setup_tab.is_simulate():
+            self._start_bpm_monitoring()
+
+    def _on_alignment_done(self, success):
+        if not success:
+            return
+        reply = QMessageBox.question(
+            self, "Save to Lookup Table",
+            "Alignment completed successfully.\nSave results to the lookup table?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        checked      = self.record_tab.get_checked_pvs()
+        simulate     = self.setup_tab.is_simulate()
+        scan_results = self.alignment_tab._last_scan_results
+        _STRING_LABELS = {"BPM Sensitivity", "MonP Sensitivity Unit", "MonP Sensitivity Num"}
+        row = {"Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        for entry in checked:
+            label  = entry["label"]
+            pv     = entry["pv"]
+            source = entry.get("source", "")
+            if source == "scan_result":
+                row[label] = scan_results.get(label, "—")
+                continue
+            if not pv:
+                continue
+            if simulate:
+                row[label] = "sim"
+            else:
+                try:
+                    import epics as _epics
+                    if label in _STRING_LABELS:
+                        val = _epics.caget(pv, as_string=True)
+                        row[label] = str(val) if val is not None else "—"
+                    elif label == "XTAL":
+                        val = _epics.caget(pv)
+                        row[label] = {0: "111", 1: "311"}.get(int(val), str(val)) if val is not None else "—"
+                    else:
+                        val = _epics.caget(pv)
+                        row[label] = f"{val:.6g}" if isinstance(val, (int, float)) else str(val) if val is not None else "—"
+                except Exception:
+                    row[label] = "err"
+        self.energy_tab.append_record_row(row)
+        self.tabs.setCurrentWidget(self.energy_tab)
+
+    def _apply_theme(self, theme_name: str):
+        if theme_name not in THEMES:
+            return
+        PAL.update(THEMES[theme_name])
+        QApplication.instance().setStyleSheet(build_qss(PAL))
+        self.alignment_tab._refresh_start_btn()
+        self.alignment_tab._refresh_abort_btn()
+        # Refresh readback label styles on next PV update (they read PAL live)
+        # Force-refresh topbar theme label color
+        self._theme_combo.parentWidget().findChild(
+            type(QLabel()), "").setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
 
     def _auto_load_config(self):
         if not os.path.exists(AUTO_CONFIG_PATH):
@@ -2321,6 +3462,14 @@ class MainWindow(QMainWindow):
             if "energy_table" in cfg:
                 self.energy_tab.set_table_data(cfg["energy_table"])
             self.mirror_tab.apply_config(cfg)
+            if "record_pv_config" in cfg:
+                self.record_tab.set_pv_config(cfg["record_pv_config"])
+            if "record_data" in cfg:
+                self.energy_tab.set_record_data(cfg["record_data"])
+            if "theme" in cfg:
+                idx = self._theme_combo.findText(cfg["theme"])
+                if idx >= 0:
+                    self._theme_combo.setCurrentIndex(idx)
             self.status.showMessage(f"Config restored from {AUTO_CONFIG_PATH}")
         except Exception as e:
             self.status.showMessage(f"Could not restore config: {e}")
@@ -2333,6 +3482,9 @@ class MainWindow(QMainWindow):
             "energy_table": self.energy_tab.get_table_data(),
             "mirror_stages": self.mirror_tab.get_mirror_stages(),
             "mirror_scan": self.mirror_tab.get_mirror_scan_params(),
+            "record_pv_config": self.record_tab.get_pv_config(),
+            "record_data": self.energy_tab.get_record_data(),
+            "theme": self._theme_combo.currentText(),
         }
         try:
             with open(AUTO_CONFIG_PATH, "w") as f:
@@ -2340,7 +3492,65 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_sim_toggled_bpm(self, is_sim: bool):
+        if is_sim or not EPICS_AVAILABLE:
+            self._stop_bpm_monitoring()
+        else:
+            self._start_bpm_monitoring()
+
+    def _start_bpm_monitoring(self):
+        import epics as _epics
+        pvs = self.setup_tab.get_pvs()
+        BPM_KEYS = ("bpm_x", "bpm_y", "bpm_intensity")
+        for key in BPM_KEYS:
+            old = self._bpm_monitored.pop(key, None)
+            if old is not None:
+                try:
+                    old.disconnect()
+                except Exception:
+                    pass
+            pv_name = pvs.get(key, "").strip()
+            if not pv_name:
+                continue
+
+            def _cb(value=None, pvname=None, bk=key, **_kw):
+                # Skip updates while alignment worker owns BPM display
+                if self.alignment_tab.abort_btn.isEnabled():
+                    return
+                if value is None:
+                    return
+                try:
+                    self._bpm_vals[bk] = float(value)
+                except Exception:
+                    return
+                self._bpm_polled.emit(
+                    self._bpm_vals["bpm_x"],
+                    self._bpm_vals["bpm_y"],
+                    self._bpm_vals["bpm_intensity"],
+                )
+
+            try:
+                pv = _epics.PV(pv_name, callback=_cb, auto_monitor=True)
+                self._bpm_monitored[key] = pv
+            except Exception:
+                pass
+
+    def _stop_bpm_monitoring(self):
+        for pv in self._bpm_monitored.values():
+            try:
+                pv.disconnect()
+            except Exception:
+                pass
+        self._bpm_monitored.clear()
+
+    def _refresh_bpm_monitors(self):
+        """Re-subscribe BPM PVs when setup changes (debounced by Qt signal coalescing)."""
+        if EPICS_AVAILABLE and not self.setup_tab.is_simulate():
+            self._start_bpm_monitoring()
+
     def closeEvent(self, event):
+        self._stop_bpm_monitoring()
+        self.setup_tab._stop_monitoring()
         self._save_config()
         super().closeEvent(event)
 
