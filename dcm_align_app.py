@@ -434,7 +434,7 @@ DEFAULT_RECORD_PVS = [
     {"label": "BPM Max Intensity w/o Mirror",   "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "MonP Max Intensity w/o Mirror",  "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "Mirror Stripe",                  "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
-    {"label": "BPM Y @ 5B (µm)",                 "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
+    {"label": "BPM Y @ 3D (µm)",                 "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "VDM Y FWHM @ 4D (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     {"label": "VFM Y FWHM @ 4E (µm)",          "pv": "",  "checked": True,  "locked": True, "source": "scan_result"},
     # ── Optional / unchecked by default ──
@@ -996,6 +996,14 @@ class AlignmentWorker(QObject):
         self.step_status.emit(3, "done")
         self.log("Step 3 complete.", "ok")
 
+        # Snapshot BPM y after DCM pitch alignment (3D)
+        if self.simulate:
+            self._scan_results["BPM Y @ 3D (µm)"] = "sim"
+        else:
+            _bpmy_3d = self.epics.get(pvs.get("bpm_y", ""))
+            self._scan_results["BPM Y @ 3D (µm)"] = (
+                f"{_bpmy_3d:.6g}" if isinstance(_bpmy_3d, (int, float)) else "—")
+
         # Snapshot intensities before mirror goes in
         if self.simulate:
             self._scan_results["BPM Max Intensity w/o Mirror"]  = "sim"
@@ -1275,14 +1283,6 @@ class AlignmentWorker(QObject):
         self.substep_status.emit("5_5b", "waiting")
         if not self.request_confirm("5_5b"): return self._abort_cleanup()
         self.substep_status.emit("5_5b", "done")
-
-        # Snapshot BPM y after DCM piezo pitch optimisation
-        if self.simulate:
-            self._scan_results["BPM Y @ 5B (µm)"] = "sim"
-        else:
-            _bpmy_5b = self.epics.get(pvs.get("bpm_y", ""))
-            self._scan_results["BPM Y @ 5B (µm)"] = (
-                f"{_bpmy_5b:.6g}" if isinstance(_bpmy_5b, (int, float)) else "—")
 
         self.substep_status.emit("5_5c", "running")
         self.log("  Scanning mirror piezo pitch → BPM y = 0…")
