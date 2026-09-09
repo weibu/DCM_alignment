@@ -609,7 +609,11 @@ class EpicsInterface:
             self._sim_vals[pv] = value
             return True
         if EPICS_AVAILABLE:
-            epics.caput(pv, value, wait=wait)
+            try:
+                epics.caput(pv, value, wait=wait)
+            except TypeError:
+                # PV is a string/char type — retry with string value
+                epics.caput(pv, str(value), wait=wait)
             return True
         return False
 
@@ -829,7 +833,8 @@ class AlignmentWorker(QObject):
         try:
             self._run_sequence()
         except Exception as e:
-            self.log(f"Unexpected error: {e}", "error")
+            import traceback
+            self.log(f"Unexpected error: {e}  —  {traceback.format_exc().splitlines()[-2]}", "error")
             self.finished.emit(False)
 
     def _run_sequence(self):
