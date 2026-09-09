@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""Shared setup for the headless test suites.
+
+Importing this module puts Qt in offscreen mode, makes dcm_align_app importable
+from the parent directory, points the app's auto-save at a throwaway file so the
+real dcm_config.json is never touched, and silences the modal dialogs.
+"""
+import os
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+import dcm_align_app as app  # noqa: E402
+
+# Never let a test write to the operator's real configuration.
+TMPDIR = tempfile.mkdtemp(prefix="dcm_test_")
+app.AUTO_CONFIG_PATH = os.path.join(TMPDIR, "test_config.json")
+
+from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PyQt6.QtCore import QTimer, QEventLoop           # noqa: E402
+
+
+def silence_dialogs(question=QMessageBox.StandardButton.Yes):
+    """Auto-answer the modal prompts so a run never blocks on one."""
+    QMessageBox.question = staticmethod(lambda *a, **k: question)
+    QMessageBox.warning = staticmethod(lambda *a, **k: None)
+    QMessageBox.critical = staticmethod(lambda *a, **k: None)
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+
+
+def qapp():
+    return QApplication.instance() or QApplication(sys.argv)
+
+
+def pump(predicate, timeout_ms=15000):
+    """Spin the Qt event loop until predicate() is true, or time out.
+
+    Returns whether the predicate came true.
+    """
+    loop = QEventLoop()
+    state = {"done": False}
+    tick = QTimer()
+    tick.setInterval(20)
+    guard = QTimer()
+    guard.setSingleShot(True)
+
+    def check():
+        if predicate():
+            state["done"] = True
+            loop.quit()
+
+    tick.timeout.connect(check)
+    guard.timeout.connect(loop.quit)
+    tick.start()
+    guard.start(timeout_ms)
+    loop.exec()
+    tick.stop()
+    guard.stop()
+    return state["done"]
+
+
+class Report:
+    """Collects pass/fail lines and sets the process exit code."""
+
+    def __init__(self, title):
+        self.failures = []
+        print(title)
+        print("-" * len(title))
+
+    def check(self, ok, msg):
+        print(("PASS  " if ok else "FAIL  ") + msg)
+        if not ok:
+            self.failures.append(msg)
+        return ok
+
+    def fail(self, msg):
+        self.check(False, msg)
+
+    def finish(self):
+        print()
+        if self.failures:
+            print("FAILURES:")
+            for f in self.failures:
+                print("  -", f)
+            sys.exit(1)
+        print("ALL TESTS PASSED")
+        sys.exit(0)

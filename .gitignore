@@ -5,3 +5,6 @@ __pycache__/
 # Microsoft Word lock and recovery files, created whenever a .docx here is open
 ~$*
 *.tmp
+
+# Test run artefacts
+*.log
