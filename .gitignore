@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Microsoft Word lock and recovery files, created whenever a .docx here is open
+~$*
+*.tmp
