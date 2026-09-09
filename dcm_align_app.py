@@ -21,12 +21,11 @@ import csv
 import json
 import os
 import random
-import math
 import threading
 import concurrent.futures
 from datetime import datetime
 import codecs
-from pathlib import Path
+import html
 
 # pyepics on Windows passes 'utf-8:surrogatescape' as a codec name, which Python rejects.
 # codecs.lookup normalises '-' → '_' before calling search functions, so the name
@@ -38,7 +37,6 @@ except LookupError:
 
 import numpy as np
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -46,12 +44,12 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox,
     QSplitter, QFrame, QFileDialog, QMessageBox, QProgressBar,
-    QAbstractItemView, QSizePolicy, QScrollArea, QStatusBar, QDialog,
+    QAbstractItemView, QScrollArea, QStatusBar, QDialog,
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QObject, QSettings, QSize,
+    Qt, QThread, pyqtSignal, QTimer, QObject,
 )
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QPen
+from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 
 import pyqtgraph as pg
 
@@ -394,6 +392,86 @@ DEFAULT_PVS = {
     "ic_sen_num":       "15IDC:A2sens_num.VAL",
 }
 
+_ENERGY_NUMERIC = (("mono_e", float, 0.0), ("ue", float, 0.0),
+                   ("harmonic", int, 1), ("roll", float, 0.0),
+                   ("pitch", float, 0.0))
+_ENERGY_STRINGS = {"bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"}
+
+
+def coerce_energy_row(row):
+    """Normalise an energy-table row to the types the sequence assumes.
+
+    Rows arrive from JSON, from CSV and from hand-edited table cells. A string
+    that survives in this dict is later written straight to a motor.
+    """
+    out = dict(row)
+    for key, cast, default in _ENERGY_NUMERIC:
+        try:
+            out[key] = cast(float(row.get(key, default)))
+        except (TypeError, ValueError):
+            out[key] = cast(default)
+    for key, default in _ENERGY_STRINGS.items():
+        val = row.get(key, default)
+        out[key] = default if val is None else str(val)
+    return out
+
+
+def coerce_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def set_spin_value(widget, value):
+    """Assign a config value to a spin box without raising. Returns success.
+
+    A float landing in a QSpinBox, or any string, used to raise TypeError; in
+    _auto_load_config a bare `except` swallowed it, so the remainder of the
+    config was silently dropped.
+    """
+    try:
+        if isinstance(widget, QSpinBox):
+            widget.setValue(int(round(float(value))))
+        else:
+            widget.setValue(float(value))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def fmt_pv_value(val):
+    """Format a caget result for the record table.
+
+    isinstance(val, (int, float)) misses numpy integer scalars and arrays, so
+    those used to fall through to str() and land in the CSV as "[1. 2. 3.]".
+    """
+    if val is None:
+        return "\u2014"
+    if isinstance(val, np.ndarray):
+        if val.size == 1:
+            return fmt_pv_value(val.item())
+        return np.array2string(val, precision=6, threshold=8, separator=",")
+    if isinstance(val, bytes):
+        return val.decode("utf-8", "replace")
+    if isinstance(val, (bool, str)):
+        return str(val)
+    try:
+        return "%.6g" % float(val)
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def fmt_xtal(val):
+    """DCM crystal-set readback -> '111'/'311'. Tolerates strings and None."""
+    if val is None:
+        return "\u2014"
+    try:
+        return {0: "111", 1: "311"}.get(int(float(val)), str(val))
+    except (TypeError, ValueError):
+        return str(val)
+
+
 def calc_harmonic(mono_e):
     if mono_e < 13:
         return 1
@@ -449,7 +527,9 @@ DEFAULT_RECORD_PVS = [
 
 DEFAULT_MIRROR_STAGES = [
     {"name": "JJC Center",           "pv": "15IDC:Slit4VDcenter.VAL",  "val_in":  0.0,    "val_out": -2.0},
-    {"name": "JJC Size",             "pv": "15IDC:Slit4VDsize.VAL",    "val_in":  0.4,    "val_out":  4.0},
+    # JJC Size stays open at 4 for the whole alignment. The 0.4 in
+    # mirror_in_out.docx is the post-alignment value and must not be used here.
+    {"name": "JJC Size",             "pv": "15IDC:Slit4VDsize.VAL",    "val_in":  4.0,    "val_out":  4.0},
     {"name": "CRL Y",                "pv": "15IDMini:m2",              "val_in":  2.0,    "val_out":  0.0},
     {"name": "VFM Y",                "pv": "ID15A1:DMS:VFM:Y",         "val_in":  0.0,    "val_out": -3000.0},
     {"name": "VDM Y",                "pv": "ID15A1:DMS:VDM:Y",         "val_in":  0.0,    "val_out":  3000.0},
@@ -459,6 +539,7 @@ DEFAULT_MIRROR_STAGES = [
 ]
 
 DEFAULT_SCAN = {
+    "dcm_signal": "BPM Intensity",
     "pitch_start": -0.05,
     "pitch_stop":   0.05,
     "pitch_steps":  25,
@@ -494,6 +575,7 @@ DEFAULT_MIRROR_SCAN = {
     "mir_vfm_stop":        250.0,
     "mir_vfm_steps":       21,
     "mir_slit_size_c":    2.0,
+    "jjc_size_pre_feedback": 0.4,
 }
 
 # ─── Mirror stripe selection ─────────────────────────────────────────────────
@@ -592,32 +674,179 @@ def fwhm_half_max(xs, ys):
     return abs(right - left)
 
 # ─── EPICS interface (real or simulated) ─────────────────────────────────────
+# ─── PV probing helpers ──────────────────────────────────────────────────────
+def probe_pv(pv_name, timeout=2.0, try_rbv=False):
+    """Connection-only check for a single PV. Returns (ok, detail).
+
+    Shared by the pre-flight check, the Check PV button in the fault dialog and
+    the Setup tab connection test, so they all report the same vocabulary.
+    """
+    name = (pv_name or "").strip()
+    if not name:
+        return False, "empty PV name"
+    if not EPICS_AVAILABLE:
+        return False, "pyepics not installed"
+    try:
+        # libca contexts are per-thread and this is called from worker threads.
+        epics.ca.use_initial_context()
+    except Exception:
+        pass
+    try:
+        pv = epics.PV(name, connection_timeout=timeout)
+        if pv.wait_for_connection(timeout=timeout):
+            pv.disconnect()
+            return True, "ok"
+        if try_rbv:
+            rbv = epics.PV(name + ".RBV", connection_timeout=timeout)
+            if rbv.wait_for_connection(timeout=timeout):
+                rbv.disconnect()
+                return True, "ok (via .RBV)"
+        return False, "timeout"
+    except Exception as exc:
+        msg = str(exc)
+        # libca on Windows surfaces an unreachable PV as an access violation
+        if "access violation" in msg.lower():
+            return False, "timeout"
+        return False, "error: %s" % msg
+
+
+def describe_pv(pv_name, timeout=2.0):
+    """Verbose single-PV diagnostic for the fault dialog Check PV button.
+
+    Returns a multi-line human-readable report. Never raises.
+    """
+    name = (pv_name or "").strip()
+    lines = []
+    if not name:
+        return "No PV name configured for this read — check the Setup tab."
+    if not EPICS_AVAILABLE:
+        return "pyepics is not installed; cannot check %s." % name
+    try:
+        epics.ca.use_initial_context()
+    except Exception:
+        pass
+
+    def _one(nm, label):
+        try:
+            pv = epics.PV(nm, connection_timeout=timeout)
+            connected = pv.wait_for_connection(timeout=timeout)
+        except Exception as exc:
+            lines.append("%-11s %s  ->  ERROR: %s" % (label, nm, exc))
+            return
+        if not connected:
+            lines.append("%-11s %s  ->  NOT CONNECTED (no response in %.1fs)" % (label, nm, timeout))
+            try:
+                pv.disconnect()
+            except Exception:
+                pass
+            return
+        try:
+            val = pv.get(timeout=timeout)
+            sval = pv.get(as_string=True, timeout=timeout)
+            lines.append("%-11s %s  ->  CONNECTED" % (label, nm))
+            lines.append("            value      = %r" % (val,))
+            lines.append("            as string  = %r" % (sval,))
+            lines.append("            type/count = %s / %s" % (pv.type, pv.count))
+            lines.append("            severity   = %s   status = %s" % (pv.severity, pv.status))
+            ts = pv.timestamp
+            if ts:
+                lines.append("            timestamp  = %s" % (
+                    datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")))
+            if getattr(pv, "host", None):
+                lines.append("            IOC host   = %s" % pv.host)
+            if val is None:
+                lines.append("            NOTE: connected, but the read still returned None.")
+        except Exception as exc:
+            lines.append("            read failed: %s" % exc)
+        finally:
+            try:
+                pv.disconnect()
+            except Exception:
+                pass
+
+    _one(name, "PV")
+    if "." not in name:
+        _one(name + ".RBV", "readback")
+    _one(name.split(".")[0] + ".DMOV", "motion")
+    return "\n".join(lines)
+
+
+# ─── EPICS interface (real or simulated) ─────────────────────────────────────
 class EpicsInterface:
+    """Thin transport over pyepics. Reports failure honestly; it sets no policy.
+
+    Callers decide what a failure means — see AlignmentWorker._read_float and
+    _write, which turn one into an operator-visible critical fault.
+    """
+
     def __init__(self, simulate=True):
         self.simulate = simulate
         self._sim_vals = {}
 
-    def get(self, pv):
+    def get(self, pv, as_string=False, timeout=3.0):
+        """Return the PV value, or None if it could not be read.
+
+        None means "no answer" — disconnected, unknown PV, or CA error. It is
+        never a legitimate reading, which is what makes the fault check sound.
+        """
         if self.simulate:
             return self._sim_vals.get(pv, 0.0)
-        if EPICS_AVAILABLE:
-            return epics.caget(pv)
-        return None
+        if not EPICS_AVAILABLE or not pv:
+            return None
+        try:
+            return epics.caget(pv, as_string=as_string,
+                               timeout=timeout, connection_timeout=timeout)
+        except Exception:
+            return None
 
-    def put(self, pv, value, wait=True):
+    def put(self, pv, value, wait=True, timeout=30.0):
+        """Write a PV. Returns (ok, reason). Never raises.
+
+        epics.caput returns 1 on success, a negative code on a low-level CA
+        failure, and None when it cannot connect — it does not raise. The old
+        implementation returned True unconditionally, so every failed write was
+        invisible and the "moved" log lines could be lies.
+        """
         if self.simulate:
             self._sim_vals[pv] = value
-            return True
-        if EPICS_AVAILABLE:
+            return True, ""
+        if not EPICS_AVAILABLE:
+            return False, "pyepics not installed"
+        if not pv:
+            return False, "empty PV name"
+        try:
+            ret = epics.caput(pv, value, wait=wait, timeout=timeout)
+        except TypeError:
+            # PV is a string/char type — retry with a string value
             try:
-                epics.caput(pv, value, wait=wait)
-            except TypeError:
-                # PV is a string/char type — retry with string value
-                epics.caput(pv, str(value), wait=wait)
-            return True
-        return False
+                ret = epics.caput(pv, str(value), wait=wait, timeout=timeout)
+            except Exception as exc:
+                return False, "caput raised %s: %s" % (type(exc).__name__, exc)
+        except Exception as exc:
+            return False, "caput raised %s: %s" % (type(exc).__name__, exc)
+        if ret is None:
+            return False, "PV not connected"
+        try:
+            if int(ret) < 0:
+                return False, "caput failed or timed out (code %s)" % ret
+        except (TypeError, ValueError):
+            pass
+        return True, ""
 
 # ─── Alignment worker thread ─────────────────────────────────────────────────
+class PVFaultAbort(Exception):
+    """Raised when the operator aborts at a PV fault prompt.
+
+    Unwinds out of the nested scan closures straight to AlignmentWorker.run(),
+    where it cannot be confused with an ordinary "the fit failed" return value.
+    """
+
+    def __init__(self, pv, context=""):
+        super().__init__("PV fault on %s: %s" % (pv, context))
+        self.pv = pv
+        self.context = context
+
+
 class AlignmentWorker(QObject):
     log_signal       = pyqtSignal(str, str)   # (message, level)
     step_status      = pyqtSignal(int, str)   # (step_num, status)
@@ -630,13 +859,19 @@ class AlignmentWorker(QObject):
     confirm_needed   = pyqtSignal(str)                 # substep key, waiting for operator
     scan_results_ready = pyqtSignal(dict)              # fit results keyed by label
     stripe_status      = pyqtSignal(str)               # "Si"/"Rh"/"Pt"/"changing"
+    pv_fault           = pyqtSignal(str, str, str)     # (pv, context, reason)
+    pv_fault_cleared   = pyqtSignal(str)               # action the operator took
+    paused_changed     = pyqtSignal(bool)              # True while blocked on a fault
+    preflight_report   = pyqtSignal(list)              # [(label, pv, status), ...]
 
     def __init__(self, pvs, scan_params, row, simulate=True, skip_mirror=True,
                  mirror_stages=None, confirm_mode=False):
         super().__init__()
         self.pvs = pvs
         self.params = scan_params
-        self.row = row
+        # Coerce once here rather than discovering a string mid-sequence, where
+        # it surfaced as a generic "Unexpected error" after motors had moved.
+        self.row = coerce_energy_row(row)
         self.simulate = simulate
         self.skip_mirror = skip_mirror
         self.mirror_stages = mirror_stages or []
@@ -644,6 +879,15 @@ class AlignmentWorker(QObject):
         self._abort        = False
         self._scan_results = {}   # populated during scans; emitted via scan_results_ready
         self._confirm_event = threading.Event()
+        # PV fault handshake. Separate Event from _confirm_event so a fault
+        # raised during a confirm-wait cannot be answered by the Proceed button.
+        self._fault_event     = threading.Event()
+        self._fault_choice    = None    # "retry" | "abort"
+        self._paused          = False
+        self._pause_requested = False   # set by external_fault() on the UI thread
+        self._pending_fault   = None    # (pv, context, reason) from a CA monitor
+        self._faulted_pvs     = set()   # distinct PVs that have faulted this run
+        self._ca_hint_shown   = False
         self.epics = EpicsInterface(simulate=simulate)
 
     def abort(self):
@@ -655,6 +899,7 @@ class AlignmentWorker(QObject):
     def _sleep(self, secs):
         steps = max(1, int(secs / 0.05))
         for _ in range(steps):
+            self._pause_point()
             if self._abort:
                 return False
             time.sleep(0.05)
@@ -664,21 +909,28 @@ class AlignmentWorker(QObject):
         self.log_signal.emit(msg, level)
 
     def _wait_motor_done(self, motor_pv, timeout=30.0):
+        """Block until the motor reports done. Returns False only on abort.
+
+        Previously this returned True after the timeout, so the caller believed
+        the move had succeeded and every `if not self._wait_motor_done(...)`
+        guard was dead code on the failure path. A stalled motor and an
+        unreadable .DMOV are now both operator-visible faults.
+        """
         if self.simulate:
             return self._sleep(0.05)
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            if self._abort:
-                return False
-            try:
-                dmov = self.epics.get(motor_pv + ".DMOV")
-                if dmov:
+        context = f"waiting for {motor_pv} to finish moving"
+        while True:
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                self._pause_point()
+                if self._abort:
+                    return False
+                if self._read_dmov(motor_pv, context):
                     return True
-            except Exception:
-                pass
-            time.sleep(0.05)
-        self.log(f"  Warning: motor {motor_pv} did not finish in {timeout}s", "warn")
-        return True
+                time.sleep(0.05)
+            if self._fault(motor_pv, context,
+                           f"motor did not report done (.DMOV) within {timeout:.0f}s") == "abort":
+                raise PVFaultAbort(motor_pv, context)
 
     def confirm(self):
         """Called from the UI thread when operator clicks Proceed."""
@@ -691,10 +943,186 @@ class AlignmentWorker(QObject):
         self._confirm_event.clear()
         self.confirm_needed.emit(substep_key)
         while not self._confirm_event.is_set():
+            self._pause_point()
             if self._abort:
                 return False
             time.sleep(0.05)
         return True
+
+    # ── PV fault handling ──────────────────────────────────────────
+
+    def fault_retry(self):
+        """UI thread: operator clicked Try Again."""
+        self._fault_choice = "retry"
+        self._fault_event.set()
+
+    def fault_abort(self):
+        """UI thread: operator clicked Abort at a fault prompt."""
+        self._fault_choice = "abort"
+        self._abort = True
+        self._fault_event.set()
+
+    def external_fault(self, pv_name, context, reason):
+        """UI thread: a live CA monitor saw a PV drop. Pause at the next safe point.
+
+        Deliberately does not emit pv_fault itself. The worker emits when it
+        reaches _pause_point(), so the UI never shows PAUSED while a motor is
+        still moving.
+        """
+        self._pending_fault   = (pv_name, context, reason)
+        self._pause_requested = True
+
+    def _fault(self, pv_name, context, reason):
+        """Log a critical error, pause the sequence, and block until the
+        operator answers. Returns "retry" or "abort".
+
+        Simulation never faults — this is the backstop behind the transport
+        layer, so a future code path that slips past it degrades to the old
+        behaviour instead of hanging a simulated run on a dialog.
+        """
+        if self.simulate:
+            self.log(f"  (sim) ignoring would-be PV fault on '{pv_name}': {reason}", "warn")
+            return "retry"
+        shown = pv_name or "(no PV name configured)"
+        self.log(f"CRITICAL — PV FAULT: {shown}", "error")
+        self.log(f"  Problem: {reason}", "error")
+        self.log(f"  While:   {context}", "error")
+        self.log("  Sequence PAUSED. Nothing further will move until you respond.", "error")
+        self._faulted_pvs.add(shown)
+        if len(self._faulted_pvs) >= 3 and not self._ca_hint_shown:
+            self._ca_hint_shown = True
+            self.log("  NOTE: three or more different PVs have faulted in this run "
+                     "even though pre-flight passed. That pattern usually means the "
+                     "worker thread lost its EPICS channel-access context rather "
+                     "than the IOCs being down.", "warn")
+        self._paused       = True
+        self._fault_choice = None
+        self._fault_event.clear()
+        self.paused_changed.emit(True)
+        self.pv_fault.emit(shown, context, reason)
+        # Poll rather than Event.wait() so the main Abort button still works.
+        while not self._fault_event.is_set():
+            if self._abort:
+                self._fault_choice = "abort"
+                break
+            time.sleep(0.05)
+        self._paused = False
+        choice = self._fault_choice or "abort"
+        self.paused_changed.emit(False)
+        self.pv_fault_cleared.emit(choice)
+        if choice == "retry":
+            self.log(f"  Operator chose Try Again — retrying {shown}.", "warn")
+        return choice
+
+    def _fault_many(self, entries, context):
+        """Report several faulted PVs at once and block on the last.
+
+        The earlier emits populate the dialog's list (and its Check PV combo)
+        without blocking, so the operator sees every failure in one place.
+        """
+        if self.simulate or not entries:
+            return "retry"
+        for pv, reason in entries[:-1]:
+            self.pv_fault.emit(pv or "(no PV name configured)", context, reason)
+        pv, reason = entries[-1]
+        return self._fault(pv, context, reason)
+
+    def _pause_point(self):
+        """Enter the fault handshake if a CA monitor flagged a disconnect.
+
+        Called from every polling loop so an asynchronous fault stops the
+        sequence between operations rather than mid-move.
+        """
+        if not self._pause_requested:
+            return
+        self._pause_requested = False
+        pv_name, context, reason = self._pending_fault or (
+            "(unknown)", "live PV monitor", "connection lost")
+        self._pending_fault = None
+        if self._fault(pv_name, context, reason) == "abort":
+            raise PVFaultAbort(pv_name, context)
+
+    def _read(self, pv_name, context, as_string=False):
+        """Checked PV read. Returns the value — guaranteed never None.
+
+        Raises PVFaultAbort if the operator aborts.
+        """
+        while True:
+            self._pause_point()
+            if self._abort:
+                raise PVFaultAbort(pv_name, context)
+            name = (pv_name or "").strip()
+            if not name:
+                if self.simulate:
+                    return 0.0   # no real PVs in simulation; blank means unused
+                reason = "no PV name is configured for this read"
+            else:
+                value = self.epics.get(name, as_string=as_string)
+                if value is not None:
+                    return value
+                if self.simulate:
+                    return 0.0
+                reason = "read returned None (PV is disconnected)"
+            if self._fault(name, context, reason) == "abort":
+                raise PVFaultAbort(name, context)
+
+    def _read_float(self, pv_name, context, allow_blank=False, default=None):
+        """Checked numeric read. Returns a float, never None.
+
+        allow_blank distinguishes "not configured" (a deliberate choice, returns
+        `default`) from "configured but disconnected" (a fault).
+        """
+        name = (pv_name or "").strip()
+        if not name and allow_blank:
+            return default
+        while True:
+            value = self._read(name, context)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                if self.simulate:
+                    return 0.0
+                if self._fault(name, context,
+                               f"read returned a non-numeric value ({value!r})") == "abort":
+                    raise PVFaultAbort(name, context)
+
+    def _read_dmov(self, motor_pv, context):
+        """Read a motor .DMOV field. A None read is a fault, not a silent stall."""
+        return self._read_float(motor_pv + ".DMOV", context)
+
+    def _write(self, pv_name, value, context, wait=True):
+        """Checked PV write. Verifies the caput return code.
+
+        Raises PVFaultAbort if the operator aborts.
+        """
+        while True:
+            self._pause_point()
+            if self._abort:
+                raise PVFaultAbort(pv_name, context)
+            name = (pv_name or "").strip()
+            if not name:
+                if self.simulate:
+                    return   # no-op, matching the pre-existing simulation behaviour
+                reason = "no PV name is configured for this write"
+            else:
+                ok, reason = self.epics.put(name, value, wait=wait)
+                if ok:
+                    return
+                if self.simulate:
+                    return
+            if self._fault(name, context, f"write of {value!r} failed: {reason}") == "abort":
+                raise PVFaultAbort(name, context)
+
+    def _signal_pv(self, choice_key, default_choice="BPM Intensity"):
+        """Resolve a configured signal-source choice to an actual PV name.
+
+        `pvs.get("ion_chamber", fallback)` is wrong here: the key normally
+        exists with an empty value, so the fallback would never apply.
+        """
+        choice = self.params.get(choice_key, default_choice)
+        if choice == "Ion Chamber":
+            return self.pvs.get("ion_chamber") or self.pvs.get("bpm_intensity", "")
+        return self.pvs.get("bpm_intensity") or self.pvs.get("ion_chamber", "")
 
     def _smart_scan_peak(self, scan_key, motor_pv, center, half_range, steps,
                          sim_fn, substep_key):
@@ -704,59 +1132,75 @@ class AlignmentWorker(QObject):
         max_ext    = p.get("smart_max_extend_steps", 10)
         fine_range = p.get("smart_fine_sigma_range", 2.0)
         fine_iter  = p.get("smart_fine_scan_iter",   3)
+        signal_pv  = self._signal_pv("dcm_signal")
 
         lo, hi = center - half_range, center + half_range
         step_size = (hi - lo) / max(steps - 1, 1)
+        ext_n = max(steps // 4, 1)
 
         xs_all, ys_all = [], []
+
+        def sorted_all():
+            """xs_all/ys_all in ascending x.
+
+            Extension scans append out of order, so anything that inspects
+            neighbouring points or the range ends must sort first.
+            """
+            if not xs_all:
+                return [], []
+            pairs = sorted(zip(xs_all, ys_all))
+            return [q[0] for q in pairs], [q[1] for q in pairs]
 
         def do_scan(a, b, n):
             if self.simulate:
                 scan_xs, scan_ys = sim_fn(a, b, n)
+                for x, y in zip(scan_xs, scan_ys):
+                    self.scan_point.emit(scan_key, float(x), float(y))
+                    xs_all.append(float(x)); ys_all.append(float(y))
             else:
                 scan_xs = list(np.linspace(a, b, n))
                 scan_ys = []
                 for x in scan_xs:
                     if self._abort: return None, None
-                    self.epics.put(motor_pv, x)
+                    self._write(motor_pv, x, f"{substep_key} — move {motor_pv} to {x:.6g}")
                     if not self._wait_motor_done(motor_pv): return None, None
                     if not self._sleep(p["settle_time"]): return None, None
-                    scan_ys.append(self.epics.get(self.pvs.get("i0", "I0")))
-            for x, y in zip(scan_xs, scan_ys):
-                if self._abort: return None, None
-                self.scan_point.emit(scan_key, float(x), float(y))
-                xs_all.append(float(x)); ys_all.append(float(y))
-                if not self._sleep(p["settle_time"]): return None, None
+                    y = self._read_float(signal_pv, f"{substep_key} — read scan signal")
+                    scan_ys.append(y)
+                    self.scan_point.emit(scan_key, float(x), float(y))
+                    xs_all.append(float(x)); ys_all.append(float(y))
+                    if self._abort: return None, None
             return scan_xs, scan_ys
 
         # initial scan
         rx, ry = do_scan(lo, hi, steps)
         if rx is None: return None, None
 
-        # extend if peak near boundary
+        # extend if the peak sits near a boundary
         for _ in range(max_ext):
-            popt = fit_super_gaussian(xs_all, ys_all)
+            xs_s, ys_s = sorted_all()
+            popt = fit_super_gaussian(xs_s, ys_s)
             if popt is None: break
             pk = popt[1]
-            span = xs_all[-1] - xs_all[0]
-            if pk < xs_all[0] + edge_frac * span:
-                new_lo = xs_all[0] - step_size * steps // 4
-                rx, ry = do_scan(new_lo, xs_all[0] - step_size, steps // 4 + 1)
+            x_lo, x_hi = xs_s[0], xs_s[-1]
+            span = x_hi - x_lo
+            if pk < x_lo + edge_frac * span:
+                rx, ry = do_scan(x_lo - step_size * ext_n, x_lo - step_size, ext_n + 1)
                 if rx is None: return None, None
-            elif pk > xs_all[-1] - edge_frac * span:
-                new_hi = xs_all[-1] + step_size * steps // 4
-                rx, ry = do_scan(xs_all[-1] + step_size, new_hi, steps // 4 + 1)
+            elif pk > x_hi - edge_frac * span:
+                rx, ry = do_scan(x_hi + step_size, x_hi + step_size * ext_n, ext_n + 1)
                 if rx is None: return None, None
             else:
                 break
 
-        popt = fit_super_gaussian(xs_all, ys_all)
+        xs_s, ys_s = sorted_all()
+        popt = fit_super_gaussian(xs_s, ys_s)
         if popt is None:
             self.log(f"  WARNING: could not fit peak in {substep_key} scan — using best estimate", "warn")
-            best_x = float(np.asarray(xs_all)[np.argmax(ys_all)])
+            best_x = float(np.asarray(xs_s)[np.argmax(ys_s)])
             return best_x, None
 
-        pk, sig = popt[1], popt[2]
+        pk, sig, p_exp = popt[1], popt[2], popt[3]
 
         # fine scan iterations
         prev_sig = sig
@@ -764,17 +1208,18 @@ class AlignmentWorker(QObject):
             fr = fine_range * abs(prev_sig)
             rx, ry = do_scan(pk - fr, pk + fr, steps)
             if rx is None: return None, None
-            popt2 = fit_super_gaussian(xs_all, ys_all)
+            xs_s, ys_s = sorted_all()
+            popt2 = fit_super_gaussian(xs_s, ys_s)
             if popt2 is None: break
-            pk, sig = popt2[1], popt2[2]
+            pk, sig, p_exp = popt2[1], popt2[2], popt2[3]
             if prev_sig / (sig + 1e-30) < 2.0: break
             prev_sig = sig
 
-        fwhm = 2.0 * sig * (np.log(2) ** (1.0 / max(popt[3], 0.5)))
-        if abs(pk - float(np.asarray(xs_all)[np.argmax(ys_all)])) < fwhm:
-            final = pk
-        else:
-            final = float(np.asarray(xs_all)[np.argmax(ys_all)])
+        # FWHM from the same fit that produced `sig` — this previously mixed the
+        # exponent from the coarse fit with sigma from the refined one.
+        fwhm = 2.0 * sig * (np.log(2) ** (1.0 / max(p_exp, 0.5)))
+        best_x = float(np.asarray(xs_s)[np.argmax(ys_s)])
+        final = pk if abs(pk - best_x) < fwhm else best_x
         self.scan_peak.emit(scan_key, final)
         return final, sig
 
@@ -782,65 +1227,267 @@ class AlignmentWorker(QObject):
                          sim_fn, substep_key):
         """Adaptive scan for BPM zero-crossing. Returns zero_pos or None."""
         p = self.params
-        edge_frac = p.get("smart_edge_fraction",    0.2)
-        max_ext   = p.get("smart_max_extend_steps", 10)
+        max_ext = p.get("smart_max_extend_steps", 10)
+        bpm_x   = self.pvs.get("bpm_x", "")
 
         lo, hi = center - half_range, center + half_range
         step_size = (hi - lo) / max(steps - 1, 1)
+        ext_n = max(steps // 4, 1)
         xs_all, ys_all = [], []
+
+        def sorted_all():
+            """xs_all/ys_all in ascending x.
+
+            find_zero_crossing walks the array sequentially, so an unsorted
+            array reports a spurious crossing at the seam between the original
+            scan and an extension — and the motor then gets moved there.
+            """
+            if not xs_all:
+                return [], []
+            pairs = sorted(zip(xs_all, ys_all))
+            return [q[0] for q in pairs], [q[1] for q in pairs]
 
         def do_scan(a, b, n):
             if self.simulate:
                 scan_xs, scan_ys = sim_fn(a, b, n)
+                for x, y in zip(scan_xs, scan_ys):
+                    self.scan_point.emit(scan_key, float(x), float(y))
+                    xs_all.append(float(x)); ys_all.append(float(y))
             else:
                 scan_xs = list(np.linspace(a, b, n))
                 scan_ys = []
                 for x in scan_xs:
                     if self._abort: return None, None
-                    self.epics.put(motor_pv, x)
+                    self._write(motor_pv, x, f"{substep_key} — move {motor_pv} to {x:.6g}")
                     if not self._wait_motor_done(motor_pv): return None, None
                     if not self._sleep(p["settle_time"]): return None, None
-                    scan_ys.append(self.epics.get(self.pvs.get("bpm_x", "BPMX")))
-            for x, y in zip(scan_xs, scan_ys):
-                if self._abort: return None, None
-                self.scan_point.emit(scan_key, float(x), float(y))
-                xs_all.append(float(x)); ys_all.append(float(y))
-                if not self._sleep(p["settle_time"]): return None, None
+                    y = self._read_float(bpm_x, f"{substep_key} — read BPM X")
+                    scan_ys.append(y)
+                    self.scan_point.emit(scan_key, float(x), float(y))
+                    xs_all.append(float(x)); ys_all.append(float(y))
+                    if self._abort: return None, None
             return scan_xs, scan_ys
 
         rx, ry = do_scan(lo, hi, steps)
         if rx is None: return None
 
-        # check if zero crossing is within the scan range, extend if not
+        # extend the range until a zero crossing is bracketed
         for _ in range(max_ext):
-            arr = np.asarray(ys_all)
-            crosses = np.where(np.diff(np.sign(arr)))[0]
-            if len(crosses) > 0: break
-            span = xs_all[-1] - xs_all[0]
-            if arr[-1] < arr[0]:  # descending, zero may be to the right
-                rx, ry = do_scan(xs_all[-1] + step_size,
-                                 xs_all[-1] + step_size * (steps // 4), steps // 4 + 1)
+            xs_s, ys_s = sorted_all()
+            arr = np.asarray(ys_s)
+            if len(np.where(np.diff(np.sign(arr)))[0]) > 0:
+                break
+            x_lo, x_hi = xs_s[0], xs_s[-1]
+            if arr[-1] < arr[0]:  # descending, so the zero lies to the right
+                rx, ry = do_scan(x_hi + step_size, x_hi + step_size * ext_n, ext_n + 1)
             else:
-                rx, ry = do_scan(xs_all[0] - step_size * (steps // 4),
-                                 xs_all[0] - step_size, steps // 4 + 1)
+                rx, ry = do_scan(x_lo - step_size * ext_n, x_lo - step_size, ext_n + 1)
             if rx is None: return None
 
-        zero = find_zero_crossing(xs_all, ys_all)
+        xs_s, ys_s = sorted_all()
+        zero = find_zero_crossing(xs_s, ys_s)
         self.scan_peak.emit(scan_key, zero)
         return zero
 
+    # ── Which PVs this run needs ───────────────────────────────────
+
+    def _mirror_yz_pvs(self):
+        """Resolve VDM:Y / VFM:Y from the mirror-stage table.
+
+        Falls back to the same hard-coded names Step 4 uses when no stage name
+        matches, so pre-flight checks exactly what the sequence will drive.
+        """
+        vdm_pv = "ID15A1:DMS:VDM:Y"
+        vfm_pv = "ID15A1:DMS:VFM:Y"
+        for stage in self.mirror_stages:
+            nm = stage.get("name", "")
+            if "VDM" in nm:
+                vdm_pv = stage["pv"]
+            elif "VFM" in nm:
+                vfm_pv = stage["pv"]
+        return vdm_pv, vfm_pv
+
+    def _jjc_size_pv(self):
+        """PV of the "JJC Size" mirror stage, or "" if it is not configured."""
+        for stage in self.mirror_stages:
+            name = stage.get("name", "")
+            if "JJC" in name and "Size" in name:
+                return (stage.get("pv") or "").strip()
+        return ""
+
+    def _required_pvs(self):
+        """PVs this run will actually touch, as [(label, pv_name, try_rbv)].
+
+        Computed dynamically — skip_mirror, blank names and the configured
+        signal sources all change the set.
+        """
+        pvs, p = self.pvs, self.params
+        out  = []
+        dmov = []
+
+        def add(label, name, try_rbv=False):
+            out.append((label, (name or "").strip(), try_rbv))
+
+        # ── always used ──
+        add("H feedback",       pvs.get("feedback_h"))
+        add("V feedback",       pvs.get("feedback_v"))
+        add("Undulator energy", pvs.get("und_energy"))
+        if (pvs.get("und_harmonic") or "").strip():
+            add("Undulator harmonic", pvs["und_harmonic"])
+        if (pvs.get("und_start") or "").strip():
+            add("Undulator start", pvs["und_start"])
+        add("Mono energy",     pvs.get("mono_energy"), try_rbv=True)
+        add("DCM roll",        pvs.get("roll"),  try_rbv=True)
+        add("DCM pitch",       pvs.get("pitch"), try_rbv=True)
+        add("DCM piezo pitch", pvs.get("piezo_pitch"))
+        add("DCM piezo roll",  pvs.get("piezo_roll"))
+        add("DCM scan signal", self._signal_pv("dcm_signal"))
+        add("BPM X",           pvs.get("bpm_x"))
+        add("BPM Y",           pvs.get("bpm_y"))
+        add("BPM intensity",   pvs.get("bpm_intensity"))
+        # 5C drives the mirror pitch piezo whether or not Step 4 ran.
+        if (pvs.get("mir_piezo_pitch") or "").strip():
+            add("Mirror piezo pitch", pvs["mir_piezo_pitch"])
+
+        dmov += [("DCM roll", pvs.get("roll")), ("DCM pitch", pvs.get("pitch"))]
+
+        # Mirror stages are driven at 2C unconditionally, and again at 4B or 5.
+        for stage in self.mirror_stages:
+            nm = (stage.get("pv") or "").strip()
+            if nm:
+                add("Stage: %s" % stage.get("name", nm), nm)
+
+        # _apply_mirror_stripe runs in both branches. These are module constants
+        # rather than entries in `pvs`, which makes them easy to overlook.
+        add("Mirror stripe VFM:X", _STRIPE_VFM_X_PV, try_rbv=True)
+        add("Mirror stripe VDM:X", _STRIPE_VDM_X_PV, try_rbv=True)
+        dmov += [("Mirror stripe VFM:X", _STRIPE_VFM_X_PV),
+                 ("Mirror stripe VDM:X", _STRIPE_VDM_X_PV)]
+
+        # ── only when Step 4 runs ──
+        if not self.skip_mirror:
+            top = (pvs.get("mir_slit_top") or "").strip()
+            bot = (pvs.get("mir_slit_bot") or "").strip()
+            if top and bot:      # mirrors the `if top_pv and bot_pv` guard in 4A
+                add("Mirror slit top",    top, try_rbv=True)
+                add("Mirror slit bottom", bot, try_rbv=True)
+                dmov += [("Mirror slit top", top), ("Mirror slit bottom", bot)]
+            vdm_pv, vfm_pv = self._mirror_yz_pvs()
+            add("VDM:Y", vdm_pv, try_rbv=True)
+            add("VFM:Y", vfm_pv, try_rbv=True)
+            dmov += [("VDM:Y", vdm_pv), ("VFM:Y", vfm_pv)]
+            if p.get("mir_signal", "BPM Intensity") != "BPM Intensity":
+                add("Mirror scan signal", self._signal_pv("mir_signal"))
+
+        for label, name in dmov:
+            name = (name or "").strip()
+            if name:
+                out.append(("%s .DMOV" % label, name + ".DMOV", False))
+
+        seen, uniq = set(), []
+        for label, name, try_rbv in out:
+            if name and name in seen:
+                continue
+            if name:
+                seen.add(name)
+            uniq.append((label, name, try_rbv))
+        return uniq
+
+    def active_pv_set(self):
+        """PV names this run touches, base names included.
+
+        Used to filter live-monitor disconnects: editing an unused PV name, or a
+        dead sensitivity readback, must not pause a run that never reads it.
+        """
+        names = set()
+        for _label, name, _rbv in self._required_pvs():
+            if name:
+                names.add(name)
+                names.add(name.split(".")[0])
+        return names
+
+    def _preflight(self):
+        """Connect-test everything the run needs, before anything moves.
+
+        Runs in the worker thread under its own CA context, so it also proves
+        the context attach worked. Serial rather than a thread pool: ad-hoc
+        threads would each need their own attach, and the probes are sub-second
+        when the IOCs are up.
+        """
+        self.log("━━ Pre-flight — checking PV connections ━━")
+        if self.simulate:
+            self.log("  Simulation mode — pre-flight skipped.", "warn")
+            self.preflight_report.emit([("(simulation)", "", "skipped")])
+            return
+        while True:
+            rows, bad = [], []
+            for label, name, try_rbv in self._required_pvs():
+                self._pause_point()
+                if self._abort:
+                    raise PVFaultAbort("(pre-flight)", "aborted during pre-flight")
+                if not name:
+                    rows.append((label, "", "not configured"))
+                    bad.append(("", "%s has no PV name configured" % label))
+                    continue
+                ok, detail = probe_pv(name, timeout=1.0, try_rbv=try_rbv)
+                if not ok and name.endswith(".DMOV"):
+                    # Warn rather than block: motion completion cannot be verified
+                    # for this motor, but the sequence can still run.
+                    rows.append((label, name, "no .DMOV"))
+                    continue
+                rows.append((label, name, detail))
+                if not ok:
+                    bad.append((name, "did not connect (%s)" % detail))
+            self.preflight_report.emit(rows)
+            n_ok = sum(1 for _l, _p, st in rows if st.startswith("ok"))
+            no_dmov = [l for l, _p, st in rows if st == "no .DMOV"]
+            for label in no_dmov:
+                self.log("  WARNING: %s has no .DMOV — motion completion cannot "
+                         "be verified for it." % label, "warn")
+            if not bad:
+                self.log("  %d / %d PVs connected. Pre-flight passed."
+                         % (n_ok, len(rows)), "ok")
+                return
+            self.log("  %d / %d PVs connected — %d FAILED. Nothing has been moved."
+                     % (n_ok, len(rows), len(bad)), "error")
+            for name, reason in bad:
+                self.log("    %s %s" % (name or "(unnamed)", reason), "error")
+            if self._fault_many(bad, "pre-flight PV connection check") == "abort":
+                raise PVFaultAbort(bad[0][0] or "(unnamed)",
+                                   "pre-flight PV connection check")
+
     def run(self):
         try:
+            if not self.simulate and EPICS_AVAILABLE:
+                # libca contexts are per-thread and pyepics resolves caget through
+                # a module-level PV cache whose channels belong to the GUI thread.
+                # Without this attach every read in this thread comes back None.
+                try:
+                    epics.ca.use_initial_context()
+                except Exception as exc:
+                    self.log(f"CRITICAL: cannot attach the EPICS CA context in the "
+                             f"worker thread: {exc}", "error")
+                    self.log("  Nothing has been moved. Stopping before any action.", "error")
+                    self.finished.emit(False)
+                    return
             self._run_sequence()
+        except PVFaultAbort as e:
+            self._abort_cleanup(f"stopped after a PV fault on {e.pv}")
         except Exception as e:
             import traceback
-            self.log(f"Unexpected error: {e}  —  {traceback.format_exc().splitlines()[-2]}", "error")
+            self.log(f"Unexpected error: {e}", "error")
+            for line in traceback.format_exc().rstrip().splitlines():
+                self.log(f"    {line}", "error")
             self.finished.emit(False)
 
     def _run_sequence(self):
         pvs = self.pvs
         row = self.row
         p   = self.params
+
+        # Verify every PV the run needs before anything moves — in particular
+        # before 2A switches the BPM feedback off.
+        self._preflight()
 
         # Emit initial BPM values so readouts are populated immediately
         self.bpm_update.emit(0.0, 0.0, 0.0)
@@ -866,9 +1513,9 @@ class AlignmentWorker(QObject):
         # 2a: Turn off BPM feedback
         self.substep_status.emit("2_2a", "running")
         self.log(f"  [{pvs['feedback_h']}] → 0  (H feedback OFF)", "warn")
-        self.epics.put(pvs['feedback_h'], 0)
+        self._write(pvs['feedback_h'], 0, "2A — disable H feedback")
         self.log(f"  [{pvs['feedback_v']}] → 0  (V feedback OFF)", "warn")
-        self.epics.put(pvs['feedback_v'], 0)
+        self._write(pvs['feedback_v'], 0, "2A — disable V feedback")
         self.feedback_update.emit(False, False)
         if not self._sleep(0.4): return self._abort_cleanup()
         self.substep_status.emit("2_2a", "done")
@@ -877,14 +1524,14 @@ class AlignmentWorker(QObject):
         self.substep_status.emit("2_2b", "running")
         self.log("  Moving motors to energy table setpoints…")
         if pvs.get("und_harmonic"):
-            self.epics.put(pvs["und_harmonic"], row["harmonic"])
+            self._write(pvs["und_harmonic"], row["harmonic"], "2B — set undulator harmonic")
             self.log(f"  [{pvs['und_harmonic']}] → {row['harmonic']}  (harmonic)", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
-        self.epics.put(pvs["und_energy"], row["ue"])
+        self._write(pvs["und_energy"], row["ue"], "2B — set undulator energy")
         self.log(f"  [{pvs['und_energy']}] → {row['ue']} keV  (undulator energy)", "ok")
         if not self._sleep(0.15): return self._abort_cleanup()
         if pvs.get("und_start"):
-            self.epics.put(pvs["und_start"], 1)
+            self._write(pvs["und_start"], 1, "2B — start undulator move")
             self.log(f"  [{pvs['und_start']}] → 1  (start undulator move)", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
         for key, pv_key, unit in [
@@ -892,7 +1539,7 @@ class AlignmentWorker(QObject):
             ("roll",   "roll",        ""),
             ("pitch",  "pitch",       ""),
         ]:
-            self.epics.put(pvs[pv_key], row[key])
+            self._write(pvs[pv_key], row[key], f"2B — set {pv_key} to {row[key]}")
             self.log(f"  [{pvs[pv_key]}] → {row[key]} {unit}", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
         self.substep_status.emit("2_2b", "done")
@@ -902,7 +1549,8 @@ class AlignmentWorker(QObject):
         self.log("  Retracting mirror from beam path…")
         for stage in self.mirror_stages:
             if stage["pv"].strip():
-                self.epics.put(stage["pv"], stage["val_out"])
+                self._write(stage["pv"], stage["val_out"],
+                            f"2C — move {stage['name']} OUT")
                 self.log(f"  [{stage['pv']}] → {stage['val_out']}  ({stage['name']} OUT)", "ok")
                 if not self._sleep(0.1): return self._abort_cleanup()
         if not self._sleep(0.4): return self._abort_cleanup()
@@ -919,9 +1567,9 @@ class AlignmentWorker(QObject):
         self.substep_status.emit("3_3a", "running")
         center = p["piezo_center"]
         self.log(f"  [{pvs['piezo_pitch']}] → {center}  (center)")
-        self.epics.put(pvs['piezo_pitch'], center)
+        self._write(pvs['piezo_pitch'], center, "3A — centre DCM pitch piezo")
         self.log(f"  [{pvs['piezo_roll']}] → {center}  (center)")
-        self.epics.put(pvs['piezo_roll'], center)
+        self._write(pvs['piezo_roll'], center, "3A — centre DCM roll piezo")
         if not self._sleep(0.4): return self._abort_cleanup()
         self.substep_status.emit("3_3a", "done")
 
@@ -943,7 +1591,7 @@ class AlignmentWorker(QObject):
         if pitch_coarse is None:
             pitch_coarse = row["pitch"]
             self.log("  INSUFFICIENT DATA: using table pitch value as fallback", "warn")
-        self.epics.put(pvs['pitch'], pitch_coarse)
+        self._write(pvs['pitch'], pitch_coarse, "3B — move pitch to the coarse peak")
         self.log(f"  Intensity peak at pitch = {pitch_coarse:.6f} → moved", "ok")
         self.substep_status.emit("3_3b", "waiting")
         if not self.request_confirm("3_3b"): return self._abort_cleanup()
@@ -967,7 +1615,7 @@ class AlignmentWorker(QObject):
         if roll_zero is None:
             roll_zero = row["roll"]
             self.log("  INSUFFICIENT DATA: using table roll value as fallback", "warn")
-        self.epics.put(pvs['roll'], roll_zero)
+        self._write(pvs['roll'], roll_zero, "3C — move roll to the BPM x zero-crossing")
         self.log(f"  BPM x zero-crossing at roll = {roll_zero:.6f} → moved", "ok")
         self.substep_status.emit("3_3c", "waiting")
         if not self.request_confirm("3_3c"): return self._abort_cleanup()
@@ -991,7 +1639,7 @@ class AlignmentWorker(QObject):
         if pitch_peak is None:
             pitch_peak = pitch_coarse
             self.log("  INSUFFICIENT DATA: using coarse pitch value as fallback", "warn")
-        self.epics.put(pvs['pitch'], pitch_peak)
+        self._write(pvs['pitch'], pitch_peak, "3D — move pitch to the fine peak")
         self.log(f"  Intensity peak at pitch = {pitch_peak:.6f} → moved", "ok")
         self.bpm_update.emit(roll_zero + random.uniform(-0.0005, 0.0005),
                              random.uniform(-0.001, 0.001), 0.97)
@@ -1005,21 +1653,26 @@ class AlignmentWorker(QObject):
         if self.simulate:
             self._scan_results["BPM Y @ 3D (µm)"] = "sim"
         else:
-            _bpmy_3d = self.epics.get(pvs.get("bpm_y", ""))
+            _bpmy_3d = self._read_float(pvs.get("bpm_y", ""), "3D — snapshot BPM Y",
+                                        allow_blank=True)
             self._scan_results["BPM Y @ 3D (µm)"] = (
-                f"{_bpmy_3d:.6g}" if isinstance(_bpmy_3d, (int, float)) else "—")
+                "—" if _bpmy_3d is None else f"{_bpmy_3d:.6g}")
 
         # Snapshot intensities before mirror goes in
         if self.simulate:
             self._scan_results["BPM Max Intensity w/o Mirror"]  = "sim"
             self._scan_results["MonP Max Intensity w/o Mirror"] = "sim"
         else:
-            _bpm_i  = self.epics.get(pvs.get("bpm_intensity", ""))
-            _monp_i = self.epics.get(pvs.get("ion_chamber", ""))
+            _bpm_i  = self._read_float(pvs.get("bpm_intensity", ""),
+                                       "3D — snapshot BPM intensity (mirror out)",
+                                       allow_blank=True)
+            _monp_i = self._read_float(pvs.get("ion_chamber", ""),
+                                       "3D — snapshot ion chamber (mirror out)",
+                                       allow_blank=True)
             self._scan_results["BPM Max Intensity w/o Mirror"]  = (
-                f"{_bpm_i:.6g}" if isinstance(_bpm_i, (int, float)) else "—")
+                "—" if _bpm_i is None else f"{_bpm_i:.6g}")
             self._scan_results["MonP Max Intensity w/o Mirror"] = (
-                f"{_monp_i:.6g}" if isinstance(_monp_i, (int, float)) else "—")
+                "—" if _monp_i is None else f"{_monp_i:.6g}")
 
         # ── Step 4: Mirror alignment (optional) ───────────────────────
         if self.skip_mirror:
@@ -1032,18 +1685,10 @@ class AlignmentWorker(QObject):
             top_pv  = pvs.get("mir_slit_top", "")
             bot_pv  = pvs.get("mir_slit_bot", "")
             mir_piezo_pv = pvs.get("mir_piezo_pitch", "")
-            signal_key   = p.get("mir_signal", "BPM Intensity")
-            signal_pv    = pvs["bpm_intensity"] if signal_key == "BPM Intensity" else pvs.get("ion_chamber", pvs["bpm_intensity"])
+            signal_pv    = self._signal_pv("mir_signal")
 
-            # Resolve VFM/VDM PVs from mirror stages table
-            vdm_pv = "ID15A1:DMS:VDM:Y"
-            vfm_pv = "ID15A1:DMS:VFM:Y"
-            for stage in self.mirror_stages:
-                nm = stage.get("name", "")
-                if "VDM" in nm:
-                    vdm_pv = stage["pv"]
-                elif "VFM" in nm:
-                    vfm_pv = stage["pv"]
+            # Resolve VFM/VDM PVs from the mirror stages table
+            vdm_pv, vfm_pv = self._mirror_yz_pvs()
 
             slit_size_a    = p.get("mir_slit_size_a", 0.1)
             slit_cen_start = p.get("mir_slit_cen_start", -2.0)
@@ -1063,12 +1708,12 @@ class AlignmentWorker(QObject):
             self.log("  4A: Slit center scan — mirror out, finding beam center…")
             slit_peak = 0.0
             if top_pv and bot_pv:
-                cur_top = self.epics.get(top_pv) or 0.0
-                cur_bot = self.epics.get(bot_pv) or 0.0
+                cur_top = self._read_float(top_pv, "4A — read slit top position")
+                cur_bot = self._read_float(bot_pv, "4A — read slit bottom position")
                 cur_cen = (cur_top + cur_bot) / 2.0
                 self.log(f"  Closing slit to {slit_size_a} mm (center ≈ {cur_cen:.3f})")
-                self.epics.put(top_pv, cur_cen + slit_size_a / 2.0)
-                self.epics.put(bot_pv, cur_cen - slit_size_a / 2.0)
+                self._write(top_pv, cur_cen + slit_size_a / 2.0, "4A — close slit top")
+                self._write(bot_pv, cur_cen - slit_size_a / 2.0, "4A — close slit bottom")
                 if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                 if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
 
@@ -1077,12 +1722,13 @@ class AlignmentWorker(QObject):
                 _true_cen = cur_cen + random.uniform(-0.3, 0.3)
                 for cen in xs_slit:
                     if self._abort: return self._abort_cleanup()
-                    self.epics.put(top_pv, cen + slit_size_a / 2.0)
-                    self.epics.put(bot_pv, cen - slit_size_a / 2.0)
+                    self._write(top_pv, cen + slit_size_a / 2.0, "4A — step slit top")
+                    self._write(bot_pv, cen - slit_size_a / 2.0, "4A — step slit bottom")
                     if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                     if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
                     sig = (gaussian(cen, _true_cen, 0.5, 1000.0, 10.0) + random.uniform(-5, 5)
-                           if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                           if self.simulate
+                           else self._read_float(signal_pv, "4A — read slit scan signal"))
                     ys_slit.append(sig)
                     self.scan_point.emit("mir_slit_cen", float(cen), float(sig))
                     if not self._sleep(p["settle_time"]): return self._abort_cleanup()
@@ -1090,8 +1736,8 @@ class AlignmentWorker(QObject):
                 slit_peak = find_peak_centroid(xs_slit, np.array(ys_slit))
                 self.scan_peak.emit("mir_slit_cen", slit_peak)
                 self.log(f"  Beam center at {slit_peak:.4f} mm → moving slit", "ok")
-                self.epics.put(top_pv, slit_peak + slit_size_a / 2.0)
-                self.epics.put(bot_pv, slit_peak - slit_size_a / 2.0)
+                self._write(top_pv, slit_peak + slit_size_a / 2.0, "4A — centre slit top")
+                self._write(bot_pv, slit_peak - slit_size_a / 2.0, "4A — centre slit bottom")
                 if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                 if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
             else:
@@ -1105,7 +1751,8 @@ class AlignmentWorker(QObject):
             self.log("  4B: Moving mirror into beam path…")
             for stage in self.mirror_stages:
                 if stage["pv"].strip():
-                    self.epics.put(stage["pv"], stage["val_in"])
+                    self._write(stage["pv"], stage["val_in"],
+                                f"4B — move {stage['name']} IN")
                     self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
                     if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.5): return self._abort_cleanup()
@@ -1118,14 +1765,15 @@ class AlignmentWorker(QObject):
             self.substep_status.emit("4_4C", "running")
             if top_pv and bot_pv:
                 self.log(f"  Narrowing slit to {slit_size_b} mm for mirror scan")
-                self.epics.put(top_pv, slit_peak + slit_size_b / 2.0)
-                self.epics.put(bot_pv, slit_peak - slit_size_b / 2.0)
+                self._write(top_pv, slit_peak + slit_size_b / 2.0, "4C — narrow slit top")
+                self._write(bot_pv, slit_peak - slit_size_b / 2.0, "4C — narrow slit bottom")
                 if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                 if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
 
             if mir_piezo_pv:
                 self.log("  Scanning mirror pitch piezo → BPMY = 0…")
-                piezo_cur = self.epics.get(mir_piezo_pv) or p.get("piezo_center", 5.0)
+                piezo_cur = self._read_float(mir_piezo_pv,
+                                             "4C — read mirror pitch piezo position")
                 mp_start = p.get("mir_piezo_start", -1.0)
                 mp_stop  = p.get("mir_piezo_stop",   1.0)
                 mp_steps = int(p.get("mir_piezo_steps", 21))
@@ -1134,17 +1782,19 @@ class AlignmentWorker(QObject):
                 _piezo_zero = piezo_cur + random.uniform(-0.1, 0.1)
                 for px in xs_piezo:
                     if self._abort: return self._abort_cleanup()
-                    self.epics.put(mir_piezo_pv, px)
+                    self._write(mir_piezo_pv, px, "4C — step mirror pitch piezo")
                     if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
                     bpmy = (-(px - _piezo_zero) * 0.5 + random.uniform(-0.002, 0.002)
-                            if self.simulate else (self.epics.get(pvs["bpm_y"]) or 0.0))
+                            if self.simulate
+                            else self._read_float(pvs["bpm_y"], "4C — read BPM Y"))
                     ys_bpmy.append(bpmy)
                     self.scan_point.emit("mir_piezo", float(px), float(bpmy))
                     self.bpm_update.emit(0.0, float(bpmy), 0.5)
 
                 piezo_zero = find_zero_crossing(xs_piezo, np.array(ys_bpmy))
                 self.scan_peak.emit("mir_piezo", piezo_zero)
-                self.epics.put(mir_piezo_pv, piezo_zero)
+                self._write(mir_piezo_pv, piezo_zero,
+                            "4C — move mirror piezo to the BPM Y zero-crossing")
                 self.log(f"  BPMY zero-crossing at piezo = {piezo_zero:.5f} → moved", "ok")
             else:
                 self.log("  Mirror piezo pitch PV not configured — skipping BPMY centering.", "warn")
@@ -1155,16 +1805,17 @@ class AlignmentWorker(QObject):
             # ── 4D: Scan VDM:Y → find peak → move ────────────────────
             self.substep_status.emit("4_4D", "running")
             self.log("  4D: Scanning VDM:Y → finding signal peak…")
-            vdm_cur = self.epics.get(vdm_pv) or 0.0
+            vdm_cur = self._read_float(vdm_pv, "4D — read VDM:Y position")
             xs_vdm = np.linspace(vdm_cur + vdm_start, vdm_cur + vdm_stop, vdm_steps)
             ys_vdm = []
             _vdm_true = vdm_cur + random.uniform(-50, 50)
             for vdm_pos in xs_vdm:
                 if self._abort: return self._abort_cleanup()
-                self.epics.put(vdm_pv, vdm_pos)
+                self._write(vdm_pv, vdm_pos, "4D — step VDM:Y")
                 if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
                 sig = (gaussian(vdm_pos, _vdm_true, 150.0, 1000.0, 10.0) + random.uniform(-5, 5)
-                       if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                       if self.simulate
+                       else self._read_float(signal_pv, "4D — read VDM scan signal"))
                 ys_vdm.append(sig)
                 self.scan_point.emit("mir_vdm", float(vdm_pos), float(sig))
                 if not self._sleep(p["settle_time"]): return self._abort_cleanup()
@@ -1174,7 +1825,7 @@ class AlignmentWorker(QObject):
             _fwhm4d = fwhm_half_max(xs_vdm, np.array(ys_vdm))
             if _fwhm4d is not None:
                 self._scan_results["VDM Y FWHM @ 4D (µm)"] = f"{_fwhm4d:.2f}"
-            self.epics.put(vdm_pv, vdm_peak)
+            self._write(vdm_pv, vdm_peak, "4D — move VDM:Y to the peak")
             if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
             self.log(f"  VDM:Y peak at {vdm_peak:.2f} → moved", "ok")
             self.substep_status.emit("4_4D", "waiting")
@@ -1184,8 +1835,8 @@ class AlignmentWorker(QObject):
             # ── 4E: Coupled VFM+VDM scan (VDM step = 2× VFM step) ────
             self.substep_status.emit("4_4E", "running")
             self.log("  4E: Coupled VFM:Y + VDM:Y scan (VDM step = 2× VFM step)…")
-            vfm_cur  = self.epics.get(vfm_pv) or 0.0
-            vdm_ref  = self.epics.get(vdm_pv) or vdm_peak
+            vfm_cur  = self._read_float(vfm_pv, "4E — read VFM:Y position")
+            vdm_ref  = self._read_float(vdm_pv, "4E — read VDM:Y reference position")
             xs_vfm   = np.linspace(vfm_cur + vfm_start, vfm_cur + vfm_stop, vfm_steps)
             ys_coupled = []
             _vfm_true = vfm_cur + random.uniform(-30, 30)
@@ -1193,12 +1844,13 @@ class AlignmentWorker(QObject):
                 if self._abort: return self._abort_cleanup()
                 vfm_delta = vfm_pos - vfm_cur
                 vdm_pos   = vdm_ref + 2.0 * vfm_delta
-                self.epics.put(vfm_pv, vfm_pos)
-                self.epics.put(vdm_pv, vdm_pos)
+                self._write(vfm_pv, vfm_pos, "4E — step VFM:Y")
+                self._write(vdm_pv, vdm_pos, "4E — step VDM:Y (2x VFM delta)")
                 if not self._wait_motor_done(vfm_pv): return self._abort_cleanup()
                 if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
                 sig = (gaussian(vfm_pos, _vfm_true, 80.0, 1000.0, 10.0) + random.uniform(-5, 5)
-                       if self.simulate else (self.epics.get(signal_pv) or 0.0))
+                       if self.simulate
+                       else self._read_float(signal_pv, "4E — read coupled scan signal"))
                 ys_coupled.append(sig)
                 self.scan_point.emit("mir_coupled", float(vfm_pos), float(sig))
                 if not self._sleep(p["settle_time"]): return self._abort_cleanup()
@@ -1210,9 +1862,9 @@ class AlignmentWorker(QObject):
             _fwhm4e = fwhm_half_max(xs_vfm, np.array(ys_coupled))
             if _fwhm4e is not None:
                 self._scan_results["VFM Y FWHM @ 4E (µm)"] = f"{_fwhm4e:.2f}"
-            self.epics.put(vfm_pv, vfm_peak_pos)
+            self._write(vfm_pv, vfm_peak_pos, "4E — move VFM:Y to the peak")
             if not self._wait_motor_done(vfm_pv): return self._abort_cleanup()
-            self.epics.put(vdm_pv, vdm_final)
+            self._write(vdm_pv, vdm_final, "4E — move VDM:Y to the coupled position")
             if not self._wait_motor_done(vdm_pv): return self._abort_cleanup()
             self.log(f"  VFM:Y → {vfm_peak_pos:.2f}  VDM:Y → {vdm_final:.2f}  (2× delta applied)", "ok")
             self.substep_status.emit("4_4E", "waiting")
@@ -1221,8 +1873,8 @@ class AlignmentWorker(QObject):
 
             if top_pv and bot_pv:
                 self.log(f"  Opening slit to {slit_size_c} mm after 4E")
-                self.epics.put(top_pv, slit_peak + slit_size_c / 2.0)
-                self.epics.put(bot_pv, slit_peak - slit_size_c / 2.0)
+                self._write(top_pv, slit_peak + slit_size_c / 2.0, "4E — reopen slit top")
+                self._write(bot_pv, slit_peak - slit_size_c / 2.0, "4E — reopen slit bottom")
                 if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                 if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
 
@@ -1239,7 +1891,8 @@ class AlignmentWorker(QObject):
             self.log("  Step 4 skipped — moving mirror into beam path now…")
             for stage in self.mirror_stages:
                 if stage["pv"].strip():
-                    self.epics.put(stage["pv"], stage["val_in"])
+                    self._write(stage["pv"], stage["val_in"],
+                                f"5 — move {stage['name']} IN")
                     self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
                     if not self._sleep(0.1): return self._abort_cleanup()
             if not self._sleep(0.4): return self._abort_cleanup()
@@ -1248,10 +1901,25 @@ class AlignmentWorker(QObject):
                 return self._abort_cleanup()
             self.substep_status.emit("5_5mir", "done")
 
+        # Close the JJC to its operating size before the feedback loops run.
+        # The alignment itself is done with the JJC wide open at 4; 0.4 is the
+        # operating value and must not be applied any earlier. This happens
+        # whether Step 4 ran or was skipped, so the mirror is in either way.
+        self.substep_status.emit("5_5jjc", "running")
+        jjc_pv  = self._jjc_size_pv()
+        jjc_val = p.get("jjc_size_pre_feedback", 0.4)
+        if jjc_pv:
+            self._write(jjc_pv, jjc_val, "5 — close JJC slit before feedback")
+            self.log(f"  [{jjc_pv}] → {jjc_val}  (JJC size, pre-feedback)", "ok")
+            if not self._sleep(0.3): return self._abort_cleanup()
+        else:
+            self.log("  No \"JJC Size\" stage configured — skipping the JJC close.", "warn")
+        self.substep_status.emit("5_5jjc", "done")
+
         self.substep_status.emit("5_5a", "running")
         self.log(f"  Enabling H feedback: DCM piezo roll → BPM x = 0…")
         if not self._sleep(0.5): return self._abort_cleanup()
-        self.epics.put(pvs['feedback_h'], 1)
+        self._write(pvs['feedback_h'], 1, "5A — enable H feedback")
         self.feedback_update.emit(True, False)
         self.bpm_update.emit(random.uniform(-0.0002, 0.0002),
                              random.uniform(-0.001, 0.001), 0.97)
@@ -1265,23 +1933,25 @@ class AlignmentWorker(QObject):
         dp_stop  = p.get("dcm_piezo_stop",   1.0)
         dp_steps = int(p.get("dcm_piezo_steps", 21))
         if dcm_piezo_pv:
-            piezo_cur = self.epics.get(dcm_piezo_pv) or p.get("piezo_center", 5.0)
+            piezo_cur = self._read_float(dcm_piezo_pv, "5B — read DCM pitch piezo position")
             xs_dcm = np.linspace(piezo_cur + dp_start, piezo_cur + dp_stop, dp_steps)
             ys_dcm = []
             _dcm_true = piezo_cur + random.uniform(-0.2, 0.2)
             for px in xs_dcm:
                 if self._abort: return self._abort_cleanup()
-                self.epics.put(dcm_piezo_pv, px)
+                self._write(dcm_piezo_pv, px, "5B — step DCM pitch piezo")
                 if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
                 sig = (gaussian(px, _dcm_true, 0.3, 1000.0, 10.0) + random.uniform(-5, 5)
-                       if self.simulate else (self.epics.get(pvs.get("i0", "")) or 0.0))
+                       if self.simulate
+                       else self._read_float(self._signal_pv("dcm_signal"),
+                                             "5B — read scan signal"))
                 ys_dcm.append(sig)
                 self.scan_point.emit("pitch", float(px), float(sig))
                 self.bpm_update.emit(random.uniform(-0.0001, 0.0001),
                                      random.uniform(-0.001, 0.001), float(sig) / 1000.0)
             dcm_piezo_peak = find_peak_centroid(xs_dcm, np.array(ys_dcm))
             self.scan_peak.emit("pitch", dcm_piezo_peak)
-            self.epics.put(dcm_piezo_pv, dcm_piezo_peak)
+            self._write(dcm_piezo_pv, dcm_piezo_peak, "5B — move DCM piezo to the peak")
             self.log(f"  Intensity peak at DCM piezo = {dcm_piezo_peak:.5f} → moved", "ok")
         else:
             self.log("  DCM piezo pitch PV not configured — skipping.", "warn")
@@ -1296,22 +1966,25 @@ class AlignmentWorker(QObject):
         mp_stop  = p.get("mir_piezo_stop",   1.0)
         mp_steps = int(p.get("mir_piezo_steps", 21))
         if mir_piezo_pv5:
-            piezo_cur5 = self.epics.get(mir_piezo_pv5) or p.get("piezo_center", 5.0)
+            piezo_cur5 = self._read_float(mir_piezo_pv5,
+                                          "5C — read mirror pitch piezo position")
             xs_mp = np.linspace(piezo_cur5 + mp_start, piezo_cur5 + mp_stop, mp_steps)
             ys_mp = []
             _mp_zero = piezo_cur5 + random.uniform(-0.1, 0.1)
             for px in xs_mp:
                 if self._abort: return self._abort_cleanup()
-                self.epics.put(mir_piezo_pv5, px)
+                self._write(mir_piezo_pv5, px, "5C — step mirror pitch piezo")
                 if not self._sleep(p.get("piezo_settle_time", 0.2)): return self._abort_cleanup()
                 bpmy = (-(px - _mp_zero) * 0.5 + random.uniform(-0.002, 0.002)
-                        if self.simulate else (self.epics.get(pvs.get("bpm_y", "")) or 0.0))
+                        if self.simulate
+                        else self._read_float(pvs.get("bpm_y", ""), "5C — read BPM Y"))
                 ys_mp.append(bpmy)
                 self.scan_point.emit("mir_piezo", float(px), float(bpmy))
                 self.bpm_update.emit(random.uniform(-0.0001, 0.0001), float(bpmy), 0.98)
             mp_zero = find_zero_crossing(xs_mp, np.array(ys_mp))
             self.scan_peak.emit("mir_piezo", mp_zero)
-            self.epics.put(mir_piezo_pv5, mp_zero)
+            self._write(mir_piezo_pv5, mp_zero,
+                        "5C — move mirror piezo to the BPM Y zero-crossing")
             self.log(f"  BPM y zero-crossing at mirror piezo = {mp_zero:.5f} → moved", "ok")
         else:
             self.log("  Mirror piezo pitch PV not configured — skipping.", "warn")
@@ -1322,7 +1995,7 @@ class AlignmentWorker(QObject):
         self.substep_status.emit("5_5d", "running")
         self.log(f"  Enabling V feedback: DCM piezo pitch → BPM y = 0…")
         if not self._sleep(0.4): return self._abort_cleanup()
-        self.epics.put(pvs['feedback_v'], 1)
+        self._write(pvs['feedback_v'], 1, "5D — enable V feedback")
         self.feedback_update.emit(True, True)
         self.log(f"  [{pvs['feedback_v']}] → 1  (V feedback ON)", "ok")
         self.substep_status.emit("5_5d", "done")
@@ -1340,13 +2013,14 @@ class AlignmentWorker(QObject):
         vfm_rbv_pv = _STRIPE_VFM_X_PV + ".RBV"
         vdm_rbv_pv = _STRIPE_VDM_X_PV + ".RBV"
         if self.simulate:
-            vfm_cur = self.epics.get(_STRIPE_VFM_X_PV)
-            vdm_cur = self.epics.get(_STRIPE_VDM_X_PV)
+            vfm_cur = float(self.epics.get(_STRIPE_VFM_X_PV) or 0.0)
+            vdm_cur = float(self.epics.get(_STRIPE_VDM_X_PV) or 0.0)
         else:
-            vfm_cur = self.epics.get(vfm_rbv_pv)
-            vdm_cur = self.epics.get(vdm_rbv_pv)
-        vfm_cur = vfm_cur or 0.0
-        vdm_cur = vdm_cur or 0.0
+            # A disconnected VFM:X used to read None -> 0.0, which matches the Si
+            # stripe position, so the app announced "already on Si, no move
+            # needed" while actually knowing nothing about the mirror.
+            vfm_cur = self._read_float(vfm_rbv_pv, "mirror stripe — read VFM:X readback")
+            vdm_cur = self._read_float(vdm_rbv_pv, "mirror stripe — read VDM:X readback")
         if abs(vfm_cur - pos["vfm_x"]) <= 10 and abs(vdm_cur - pos["vdm_x"]) <= 10:
             self.log(f"  Already on {stripe} stripe — no move needed", "ok")
             self.stripe_status.emit(stripe)
@@ -1354,8 +2028,8 @@ class AlignmentWorker(QObject):
             return True
         self.log(f"  Selecting mirror stripe: {stripe} (energy {energy_kev} keV)")
         self.stripe_status.emit("changing")
-        self.epics.put(_STRIPE_VFM_X_PV, pos["vfm_x"])
-        self.epics.put(_STRIPE_VDM_X_PV, pos["vdm_x"])
+        self._write(_STRIPE_VFM_X_PV, pos["vfm_x"], f"mirror stripe — move VFM:X for {stripe}")
+        self._write(_STRIPE_VDM_X_PV, pos["vdm_x"], f"mirror stripe — move VDM:X for {stripe}")
         if not self._wait_motor_done(_STRIPE_VFM_X_PV): return False
         if not self._wait_motor_done(_STRIPE_VDM_X_PV): return False
         self.log(f"  VFM:X → {pos['vfm_x']}  VDM:X → {pos['vdm_x']}  ({stripe} stripe)", "ok")
@@ -1363,8 +2037,8 @@ class AlignmentWorker(QObject):
         self._scan_results["Mirror Stripe"] = stripe
         return True
 
-    def _abort_cleanup(self):
-        self.log("Alignment aborted by user.", "error")
+    def _abort_cleanup(self, reason="aborted by user"):
+        self.log(f"Alignment {reason}.", "error")
         self.finished.emit(False)
 
 
@@ -1441,62 +2115,6 @@ def make_plot(title="", y_label="Signal", x_label="Motor position"):
     if title:
         plot.setTitle(title, color=PAL["text_sec"], size="11pt")
     return plot
-
-
-# ─── Step header widget ───────────────────────────────────────────────────────
-class StepHeader(QWidget):
-    STATUS_COLORS = {
-        "idle":    PAL["text_dim"],
-        "running": PAL["amber"],
-        "done":    PAL["green"],
-        "error":   PAL["red"],
-    }
-
-    def __init__(self, step_num, title, parent=None):
-        super().__init__(parent)
-        self.step_num = step_num
-        self._status = "idle"
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 8)
-
-        self.circle = QLabel(str(step_num))
-        self.circle.setFixedSize(28, 28)
-        self.circle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.circle.setStyleSheet(f"""
-            border: 2px solid {PAL['text_dim']};
-            border-radius: 14px;
-            color: {PAL['text_dim']};
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-
-        title_lbl = QLabel(title)
-        title_lbl.setObjectName("step_title")
-        self.tag = make_tag("Idle", "grey")
-
-        lay.addWidget(self.circle)
-        lay.addWidget(title_lbl)
-        lay.addStretch()
-        lay.addWidget(self.tag)
-
-    def set_status(self, status):
-        self._status = status
-        color = self.STATUS_COLORS.get(status, PAL["text_dim"])
-        self.circle.setStyleSheet(f"""
-            border: 2px solid {color};
-            border-radius: 14px;
-            color: {color};
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            font-weight: 700;
-        """)
-        tag_color = {"idle": "grey", "running": "amber", "done": "green", "error": "red"}.get(status, "grey")
-        tag_text  = {"idle": "Idle", "running": "Running…", "done": "Complete", "error": "Error"}.get(status, "Idle")
-        self.tag.setObjectName({"grey": "tag_grey", "amber": "tag_amber", "green": "tag_green", "red": "tag_red"}.get(tag_color, "tag_grey"))
-        self.tag.setText(tag_text)
-        self.tag.style().unpolish(self.tag)
-        self.tag.style().polish(self.tag)
 
 
 # ─── Beam path widget ─────────────────────────────────────────────────────────
@@ -1587,25 +2205,185 @@ class LogWidget(QTextEdit):
                    "warn": PAL["amber"],    "error": PAL["red"]}
         color = _colors.get(level, PAL["text_sec"])
         ts = time.strftime("%H:%M:%S")
+        safe = html.escape(str(msg)).replace("  ", "&nbsp;&nbsp;")
         self.append(
             f'<span style="color:{PAL["text_dim"]}">{ts}</span> '
-            f'<span style="color:{color}">{msg}</span>'
+            f'<span style="color:{color}">{safe}</span>'
         )
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+
+# ─── PV fault dialog ─────────────────────────────────────────────────────────
+class PVFaultDialog(QDialog):
+    """Critical dialog shown while the alignment sequence is paused on a PV fault.
+
+    Deliberately shown with show() rather than exec(): exec() starts a nested
+    event loop, which would deliver further queued worker signals and let a
+    second fault stack another dialog on top of this one. The sequence is
+    genuinely stopped because the *worker thread* is blocked, so leaving the GUI
+    responsive costs nothing and lets the operator inspect the Setup tab, the
+    live readouts and the log while deciding.
+    """
+
+    retry_clicked = pyqtSignal()
+    abort_clicked = pyqtSignal()
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CRITICAL — EPICS PV Fault")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(740, 480)
+        self._check_future = None
+        self._check_pool   = None
+        self._check_timer  = None
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        hdr = QLabel("⛔  ALIGNMENT PAUSED — EPICS PV FAULT")
+        hdr.setStyleSheet(
+            f"background: {PAL['tag_red_bg']}; border: 1px solid {PAL['red']};"
+            f" border-radius: 4px; color: {PAL['red']}; font-size: 14px;"
+            f" font-weight: 700; padding: 8px 12px;"
+        )
+        lay.addWidget(hdr)
+
+        self._detail = QTextEdit()
+        self._detail.setReadOnly(True)
+        self._detail.setMaximumHeight(150)
+        lay.addWidget(self._detail)
+
+        pick = QHBoxLayout()
+        pick.addWidget(QLabel("Check PV:"))
+        self._pv_combo = QComboBox()
+        self._pv_combo.setMinimumWidth(300)
+        pick.addWidget(self._pv_combo, 1)
+        self.check_btn = styled_button("Check PV")
+        self.check_btn.setToolTip("Connect to this PV now and report what it returns.\n"
+                                  "Does not resume the sequence.")
+        pick.addWidget(self.check_btn)
+        lay.addLayout(pick)
+
+        self._diag = QTextEdit()
+        self._diag.setReadOnly(True)
+        self._diag.setPlaceholderText("Press Check PV to test this PV for aliveness.")
+        lay.addWidget(self._diag, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.retry_btn = styled_button("Try Again", "primary")
+        self.retry_btn.setToolTip("Re-read the PV and, if it answers, carry on from here.")
+        self.abort_btn = styled_button("Abort Alignment", "danger")
+        btns.addWidget(self.retry_btn)
+        btns.addWidget(self.abort_btn)
+        lay.addLayout(btns)
+
+        self.check_btn.clicked.connect(self._on_check)
+        self.retry_btn.clicked.connect(self._on_retry)
+        self.abort_btn.clicked.connect(self._on_abort)
+
+        self.refresh(rows)
+
+    # ── content ───────────────────────────────────────────────
+
+    def refresh(self, rows):
+        """Re-render in place. Never opens a second dialog."""
+        blocks = []
+        for pv, context, reason, when in rows:
+            blocks.append(
+                f'<div style="margin-bottom:10px">'
+                f'<div style="color:{PAL["red"]};font-weight:700">'
+                f'PV&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {html.escape(pv)}</div>'
+                f'<div style="color:{PAL["text_sec"]}">'
+                f'Problem&nbsp; {html.escape(reason)}</div>'
+                f'<div style="color:{PAL["text_sec"]}">'
+                f'While&nbsp;&nbsp;&nbsp; {html.escape(context)}</div>'
+                f'<div style="color:{PAL["text_dim"]}">'
+                f'Detected&nbsp;{html.escape(when)}</div>'
+                f'</div>'
+            )
+        self._detail.setHtml(
+            '<div style="font-family:JetBrains Mono,Consolas,monospace;font-size:11px">'
+            + "".join(blocks) + '</div>'
+        )
+        current = self._pv_combo.currentText()
+        names = []
+        for pv, _c, _r, _w in rows:
+            if pv and pv not in names:
+                names.append(pv)
+        self._pv_combo.blockSignals(True)
+        self._pv_combo.clear()
+        self._pv_combo.addItems(names)
+        idx = self._pv_combo.findText(current)
+        self._pv_combo.setCurrentIndex(idx if idx >= 0 else max(0, len(names) - 1))
+        self._pv_combo.blockSignals(False)
+
+    def set_busy(self, busy):
+        """Disable the action buttons once a choice has been made."""
+        self.retry_btn.setEnabled(not busy)
+        self.abort_btn.setEnabled(not busy)
+
+    # ── Check PV ───────────────────────────────────────────
+
+    def _on_check(self):
+        pv = self._pv_combo.currentText().strip()
+        if not pv:
+            self._diag.setPlainText("No PV name to check — the read had no PV configured. "
+                                    "Set it in the Setup tab.")
+            return
+        self._diag.setPlainText("Checking %s …" % pv)
+        self.check_btn.setEnabled(False)
+        self._check_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._check_future = self._check_pool.submit(describe_pv, pv)
+        # Poll with a timer rather than spinning on processEvents(), which would
+        # re-enter the event loop from inside a slot.
+        self._check_timer = QTimer(self)
+        self._check_timer.setInterval(100)
+        self._check_timer.timeout.connect(self._poll_check)
+        self._check_timer.start()
+
+    def _poll_check(self):
+        if self._check_future is None or not self._check_future.done():
+            return
+        self._check_timer.stop()
+        try:
+            text = self._check_future.result()
+        except Exception as exc:
+            text = "Check failed: %s" % exc
+        self._diag.setPlainText(text)
+        self.check_btn.setEnabled(True)
+        try:
+            self._check_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        self._check_future = None
+
+    # ── actions ─────────────────────────────────────────────
+
+    def _on_retry(self):
+        self.set_busy(True)          # disable both first, so Retry-then-Abort cannot race
+        self.retry_clicked.emit()
+
+    def _on_abort(self):
+        self.set_busy(True)
+        self.abort_clicked.emit()
 
 
 # ─── Setup Tab ───────────────────────────────────────────────────────────────
 class SetupTab(QWidget):
     changed          = pyqtSignal()
     pv_readback      = pyqtSignal(str, str)   # (key, value_str)
+    pv_disconnected  = pyqtSignal(str, str)   # (key, pv_name) — CA connection lost
     _string_refresh  = pyqtSignal(str)         # key — triggers Qt-thread string read
 
     _RBK_MONO = "font-family: 'JetBrains Mono',Consolas,monospace; font-size: 11px; padding: 0 6px; min-width: 88px;"
 
     @staticmethod
     def _rbk_style(variant: str) -> str:
-        c = PAL['cyan'] if variant == "ok" else (PAL['amber'] if variant == "err" else PAL['text_dim'])
-        return f"color: {c}; {SetupTab._RBK_MONO}"
+        c = {"ok": PAL['cyan'], "err": PAL['amber'],
+             "bad": PAL['red']}.get(variant, PAL['text_dim'])
+        weight = "font-weight: 700;" if variant == "bad" else ""
+        return f"color: {c}; {weight} {SetupTab._RBK_MONO}"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1614,6 +2392,10 @@ class SetupTab(QWidget):
         self._pv_value_labels    = {}
         self._monitored_pvs      = {}   # key → epics.PV object
         self._resubscribe_timers = {}   # key → QTimer (debounce)
+        # PV names we are tearing down ourselves. pv.disconnect() fires the
+        # connection callback, and without this the fault router would treat our
+        # own re-subscribe as a hardware disconnect.
+        self._resubscribing      = set()
         self._string_refresh.connect(self._on_string_refresh)
         self._build()
 
@@ -1710,6 +2492,16 @@ class SetupTab(QWidget):
 
         scan_box = QGroupBox("Scan Parameters")
         scan_lay = QGridLayout(scan_box)
+        # Which detector the DCM pitch/piezo scans read. The code used to look up
+        # a "i0" PV key that exists in neither DEFAULT_PVS nor the saved config,
+        # so on hardware it read a PV literally named "I0" (or "").
+        scan_lay.addWidget(QLabel("DCM scan signal"), 0, 0)
+        dcm_sig_cb = QComboBox()
+        dcm_sig_cb.addItems(["BPM Intensity", "Ion Chamber"])
+        dcm_sig_cb.setToolTip("Detector read by the Step 3 pitch scans and the "
+                              "Step 5B DCM piezo scan.")
+        self._scan_fields["dcm_signal"] = dcm_sig_cb
+        scan_lay.addWidget(dcm_sig_cb, 0, 1)
         scan_defs = [
             ("pitch_start",  "Pitch scan start",  QDoubleSpinBox, -1000.0, 0.0, -0.05, 4),
             ("pitch_stop",   "Pitch scan stop",   QDoubleSpinBox,     0.0, 1000.0,  0.05, 4),
@@ -1731,7 +2523,7 @@ class SetupTab(QWidget):
             ("mir_piezo_stop",   "Mirror pitch piezo scan stop",  QDoubleSpinBox,     0.0, 1000.0, 1.0, 3),
             ("mir_piezo_steps",  "Mirror pitch piezo scan steps", QSpinBox,        3, 200,   21,   0),
         ]
-        for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(scan_defs):
+        for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(scan_defs, start=1):
             scan_lay.addWidget(QLabel(lbl), r, 0)
             if cls == QDoubleSpinBox:
                 sb = NoScrollDoubleSpinBox()
@@ -1823,19 +2615,30 @@ class SetupTab(QWidget):
     def _stop_monitoring(self):
         for pv in self._monitored_pvs.values():
             try:
+                self._mark_resubscribing(getattr(pv, "pvname", ""))
                 pv.disconnect()
             except Exception:
                 pass
         self._monitored_pvs.clear()
         for lbl in self._pv_value_labels.values():
             lbl.setText("—")
-            lbl.setStyleSheet(self._RBK_STYLE_DIM)
+            lbl.setStyleSheet(self._rbk_style("dim"))
+
+    def _mark_resubscribing(self, pv_name):
+        """Suppress the disconnect callback caused by our own teardown."""
+        name = (pv_name or "").strip()
+        if not name:
+            return
+        self._resubscribing.add(name)
+        # Outlive the router's 2 s debounce.
+        QTimer.singleShot(3000, lambda n=name: self._resubscribing.discard(n))
 
     def _subscribe_pv(self, key: str):
         # Tear down any existing subscription for this key
         old = self._monitored_pvs.pop(key, None)
         if old is not None:
             try:
+                self._mark_resubscribing(getattr(old, "pvname", ""))
                 old.disconnect()
             except Exception:
                 pass
@@ -1868,8 +2671,10 @@ class SetupTab(QWidget):
                 self.pv_readback.emit(key, str(char_value or value)[:16])
 
         def _conn_cb(pvname=None, conn=None, **_kw):
+            # Runs on a libca callback thread: emit signals, never touch widgets.
             if not conn:
-                self.pv_readback.emit(key, "n/c")
+                self.pv_readback.emit(key, "DISCONNECTED")
+                self.pv_disconnected.emit(key, actual)
             elif key in _string_keys:
                 self._string_refresh.emit(key)
 
@@ -1908,10 +2713,20 @@ class SetupTab(QWidget):
         lbl = self._pv_value_labels.get(key)
         if lbl is None:
             return
-        if value in ("—", "n/c", "err"):
-            lbl.setStyleSheet(self._rbk_style("err" if value == "err" else "dim"))
+        if value == "DISCONNECTED":
+            # Previously shown as a dim "n/c", indistinguishable from a PV that
+            # was simply never configured.
+            lbl.setStyleSheet(self._rbk_style("bad"))
+            lbl.setToolTip("Channel access reports this PV as disconnected.")
+        elif value == "err":
+            lbl.setStyleSheet(self._rbk_style("err"))
+            lbl.setToolTip("Could not subscribe to this PV.")
+        elif value == "—":
+            lbl.setStyleSheet(self._rbk_style("dim"))
+            lbl.setToolTip("")
         else:
             lbl.setStyleSheet(self._rbk_style("ok"))
+            lbl.setToolTip("")
         lbl.setText(value)
 
     def _test_epics(self):
@@ -1919,38 +2734,32 @@ class SetupTab(QWidget):
             QMessageBox.warning(self, "Test EPICS Connection",
                                 "pyepics is not installed — cannot test connections.")
             return
-        import epics
         pvs = self.get_pvs()
         timeout = 2.0
-        results = {}
 
         def _check(key, pv_name):
             if not pv_name.strip():
-                results[key] = (pv_name, "skipped")
-                return
-            try:
-                pv = epics.PV(pv_name, connection_timeout=timeout)
-                connected = pv.wait_for_connection(timeout=timeout)
-                if connected:
-                    pv.disconnect()
-                    results[key] = (pv_name, "ok")
-                elif key in MOTOR_PV_KEYS:
-                    rbv = epics.PV(pv_name + ".RBV", connection_timeout=timeout)
-                    connected_rbv = rbv.wait_for_connection(timeout=timeout)
-                    if connected_rbv:
-                        rbv.disconnect()
-                    results[key] = (pv_name, "ok (via .RBV)" if connected_rbv else "timeout")
-                else:
-                    results[key] = (pv_name, "timeout")
-            except Exception as e:
-                msg = str(e)
-                results[key] = (pv_name, "timeout" if "access violation" in msg.lower() else f"error: {msg}")
+                return key, (pv_name, "skipped")
+            _ok, detail = probe_pv(pv_name, timeout=timeout,
+                                   try_rbv=(key in MOTOR_PV_KEYS))
+            return key, (pv_name, detail)
 
-        threads = [threading.Thread(target=_check, args=(k, v)) for k, v in pvs.items()]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        # Pre-seed so the dialog lists PVs in Setup-field order, not completion
+        # order, and so a crashed probe still shows a row.
+        results = {k: (v, "timeout") for k, v in pvs.items()}
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(len(pvs), 1)) as ex:
+                pending = {ex.submit(_check, k, v) for k, v in pvs.items()}
+                while pending:
+                    done, pending = concurrent.futures.wait(pending, timeout=0.05)
+                    QApplication.processEvents()   # keep the window repainting
+                    for f in done:
+                        k, val = f.result()
+                        results[k] = val
+        finally:
+            QApplication.restoreOverrideCursor()
 
         labels = {
             "mono_energy": "Mono Energy", "roll": "DCM Roll", "pitch": "DCM Pitch",
@@ -2013,21 +2822,27 @@ class SetupTab(QWidget):
             QMessageBox.critical(self, "Save Config", f"Could not write file:\n{e}")
 
     def _apply_config(self, cfg):
+        """Apply a saved config. Returns the keys that could not be applied."""
+        bad = []
         for k, v in cfg.get("pvs", {}).items():
             if k in self._pv_fields:
-                self._pv_fields[k].setText(str(v))
+                self._pv_fields[k].setText("" if v is None else str(v))
         for k, v in cfg.get("scan", {}).items():
             if k not in self._scan_fields:
                 continue
             w = self._scan_fields[k]
             if isinstance(w, (QDoubleSpinBox, QSpinBox)):
-                w.setValue(v)
+                if not set_spin_value(w, v):
+                    bad.append(k)
             elif isinstance(w, QComboBox):
                 idx = w.findText(str(v))
                 if idx >= 0:
                     w.setCurrentIndex(idx)
+                else:
+                    bad.append(k)
         if "simulate" in cfg:
             self.sim_check.setChecked(bool(cfg["simulate"]))
+        return bad
 
     def _load_config(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Config", "", "JSON files (*.json)")
@@ -2179,7 +2994,10 @@ class EnergyTableTab(QWidget):
         if r >= len(self._data):
             return
         key = self._COLS[c]
-        text = self.table.item(r, c).text()
+        item = self.table.item(r, c)
+        if item is None:
+            return
+        text = item.text()
         if key in ("bpm_sen", "ic_sen_unit", "ic_sen_num"):
             self._data[r][key] = text
             self.changed.emit()
@@ -2194,7 +3012,16 @@ class EnergyTableTab(QWidget):
     def _sort_rows(self):
         idx = self._sort_combo.currentIndex()
         key = self._SORT_KEYS[idx] if idx < len(self._SORT_KEYS) else "mono_e"
-        self._data.sort(key=lambda r: r.get(key, 0))
+
+        def sort_key(r):
+            # A mixed str/float column would otherwise raise
+            # TypeError: '<' not supported between instances of 'str' and 'float'.
+            try:
+                return (0, float(r.get(key, 0)))
+            except (TypeError, ValueError):
+                return (1, 0.0)
+
+        self._data.sort(key=sort_key)
         self._refresh_table()
         self.changed.emit()
 
@@ -2205,6 +3032,10 @@ class EnergyTableTab(QWidget):
             self.sel_label.setText("No row selected")
             return
         r = self.table.currentRow()
+        if r < 0 or r >= len(self._data):
+            self._selected = None
+            self.sel_label.setText("No row selected")
+            return
         self._selected = self._data[r]
         self.sel_label.setText(
             f"Selected: MonoE = {self._selected['mono_e']} keV  |  UE = {self._selected['ue']} keV"
@@ -2214,10 +3045,9 @@ class EnergyTableTab(QWidget):
 
     def _add_row(self):
         if self._data:
-            new_row = dict(self._data[-1])
+            new_row = coerce_energy_row(self._data[-1])
         else:
-            new_row = {"mono_e": 0.0, "ue": 0.0, "harmonic": 1, "roll": 0.0, "pitch": 0.0,
-                       "bpm_sen": "1", "ic_sen_unit": "2", "ic_sen_num": "2"}
+            new_row = coerce_energy_row({})
         self._data.append(new_row)
         self._refresh_table()
         self.table.selectRow(len(self._data) - 1)
@@ -2241,18 +3071,12 @@ class EnergyTableTab(QWidget):
             for row in reader:
                 try:
                     mono_e = float(row.get("mono_e", 0))
-                    self._data.append({
-                        "mono_e":      mono_e,
-                        "ue":          float(row.get("ue", 0)),
-                        "harmonic":    int(row["harmonic"]) if "harmonic" in row else calc_harmonic(mono_e),
-                        "roll":        float(row.get("roll", 0)),
-                        "pitch":       float(row.get("pitch", 0)),
-                        "bpm_sen":     str(row.get("bpm_sen", "1")),
-                        "ic_sen_unit": str(row.get("ic_sen_unit", "2")),
-                        "ic_sen_num":  str(row.get("ic_sen_num", "2")),
-                    })
-                except (ValueError, KeyError):
-                    pass
+                except (TypeError, ValueError):
+                    continue   # not a data row
+                entry = dict(row)
+                if not str(row.get("harmonic", "")).strip():
+                    entry["harmonic"] = calc_harmonic(mono_e)
+                self._data.append(coerce_energy_row(entry))
         self._refresh_table()
         self.changed.emit()
 
@@ -2273,7 +3097,7 @@ class EnergyTableTab(QWidget):
         return [dict(r) for r in self._data]
 
     def set_table_data(self, data):
-        self._data = [dict(r) for r in data]
+        self._data = [coerce_energy_row(r) for r in data]
         self._refresh_table()
 
     # ── Lookup table (record of past alignments) ──
@@ -2424,6 +3248,7 @@ class AlignmentTab(QWidget):
         "4_4D": "VDM:Y scan → peak",
         "4_4E": "Coupled VFM:Y+VDM:Y → peak",
         "5_5mir": "Mirror in",
+        "5_5jjc": "Close JJC slit before feedback",
         "5_5a": "Turn on H feedback",
         "5_5b": "DCM piezo pitch scan → max intensity",
         "5_5c": "Mirror piezo pitch scan → BPM y = 0",
@@ -2436,6 +3261,13 @@ class AlignmentTab(QWidget):
         self._worker           = None
         self._thread           = None
         self._last_scan_results = {}
+        self._running          = False
+        self._faulted          = False
+        self._fault_dlg        = None
+        self._fault_rows       = []   # [(pv, context, reason, timestamp), ...]
+        self._stripe_future    = None
+        self._stripe_pool      = None
+        self._stripe_timer     = None
         self._build()
         self._on_skip_mirror_changed()
         QTimer.singleShot(800, self._refresh_stripe_display)
@@ -2495,6 +3327,22 @@ class AlignmentTab(QWidget):
         self.proceed_btn.setVisible(False)
         self.proceed_btn.clicked.connect(self._proceed_clicked)
         ctrl_l.addWidget(self.proceed_btn)
+        # PV fault banner — hidden unless a PV fault is pending or active
+        self.fault_banner = QWidget()
+        self.fault_banner.setVisible(False)
+        fb = QVBoxLayout(self.fault_banner)
+        fb.setContentsMargins(8, 6, 8, 6)
+        fb.setSpacing(3)
+        self.fault_tag = QLabel()
+        self.fault_tag.setWordWrap(True)
+        self.fault_pv_lbl = QLabel()
+        self.fault_pv_lbl.setWordWrap(True)
+        self.fault_btn = styled_button("Review fault…")
+        fb.addWidget(self.fault_tag)
+        fb.addWidget(self.fault_pv_lbl)
+        fb.addWidget(self.fault_btn)
+        self.fault_btn.clicked.connect(self._open_fault_dialog)
+        ctrl_l.addWidget(self.fault_banner)
         self.progress = QProgressBar()
         self.progress.setRange(0, 5)
         self.progress.setValue(0)
@@ -2544,6 +3392,7 @@ class AlignmentTab(QWidget):
               ("4E", "Coupled VFM:Y+VDM:Y → peak")]),
             (5, "Enable Feedback Loops",
              [("5mir", "Mirror in"),
+              ("5jjc", "Close JJC slit before feedback"),
               ("5a", "Turn on H feedback"),
               ("5b", "DCM piezo pitch scan → max intensity"),
               ("5c", "Mirror piezo pitch scan → BPM y = 0"),
@@ -2701,12 +3550,22 @@ class AlignmentTab(QWidget):
             lbl.setVisible(skip)
 
     def _refresh_stripe_display(self):
-        if not EPICS_AVAILABLE:
+        """Read the mirror stripe position in the background and update the badge.
+
+        Polled with a QTimer rather than `while not fut.done(): processEvents()`,
+        which burned a whole core for up to 4 s at startup and re-entered the
+        event loop from inside a slot.
+        """
+        if not EPICS_AVAILABLE or self._stripe_future is not None:
             return
-        import concurrent.futures
+
         def _read():
             try:
                 import epics as _epics
+                try:
+                    _epics.ca.use_initial_context()   # per-thread CA context
+                except Exception:
+                    pass
                 vfm = _epics.caget(_STRIPE_VFM_X_PV + ".RBV", timeout=2.0)
                 vdm = _epics.caget(_STRIPE_VDM_X_PV + ".RBV", timeout=2.0)
                 if vfm is None or vdm is None:
@@ -2717,11 +3576,27 @@ class AlignmentTab(QWidget):
             except Exception:
                 pass
             return None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_read)
-            while not fut.done():
-                QApplication.processEvents()
-            stripe = fut.result()
+
+        self._stripe_pool   = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._stripe_future = self._stripe_pool.submit(_read)
+        self._stripe_timer  = QTimer(self)
+        self._stripe_timer.setInterval(150)
+        self._stripe_timer.timeout.connect(self._poll_stripe)
+        self._stripe_timer.start()
+
+    def _poll_stripe(self):
+        if self._stripe_future is None or not self._stripe_future.done():
+            return
+        self._stripe_timer.stop()
+        try:
+            stripe = self._stripe_future.result()
+        except Exception:
+            stripe = None
+        self._stripe_future = None
+        try:
+            self._stripe_pool.shutdown(wait=False)
+        except Exception:
+            pass
         if stripe:
             self._stripe_widget.set_stripe(stripe)
 
@@ -2822,6 +3697,10 @@ class AlignmentTab(QWidget):
         )
 
     def start_alignment(self, pvs=None, scan_params=None, simulate=True, mirror_stages=None):
+        if self._running:
+            QMessageBox.information(self, "Alignment already running",
+                                    "A sequence is already in progress. Abort it first.")
+            return
         if not self._selected_row:
             QMessageBox.warning(self, "No row selected",
                                 "Please select an energy row in the Energy Table tab first.")
@@ -2831,8 +3710,11 @@ class AlignmentTab(QWidget):
         mirror_stages = mirror_stages or DEFAULT_MIRROR_STAGES
 
         self._reset_ui()
+        self._running = True
         self.start_btn.setEnabled(False)
         self.abort_btn.setEnabled(True)
+        self.skip_mirror_chk.setEnabled(False)
+        self.confirm_chk.setEnabled(False)
 
         self._thread = QThread()
         self._worker = AlignmentWorker(
@@ -2854,6 +3736,10 @@ class AlignmentTab(QWidget):
         self._worker.confirm_needed.connect(self._on_confirm_needed)
         self._worker.scan_results_ready.connect(self._on_scan_results)
         self._worker.stripe_status.connect(self._stripe_widget.set_stripe)
+        self._worker.pv_fault.connect(self._on_pv_fault)
+        self._worker.pv_fault_cleared.connect(self._on_pv_fault_cleared)
+        self._worker.paused_changed.connect(self._on_paused_changed)
+        self._worker.preflight_report.connect(self._on_preflight_report)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
@@ -2921,25 +3807,134 @@ class AlignmentTab(QWidget):
 
     def _on_confirm_needed(self, substep_key):
         self.proceed_btn.setVisible(True)
-        self.proceed_btn.setEnabled(True)
+        self.proceed_btn.setEnabled(not self._faulted)
         self.log.append_log(f"  ⏸  Waiting for operator confirmation after {substep_key} — click Proceed to continue", "warn")
 
     def _proceed_clicked(self):
+        if self._faulted or self._fault_dlg is not None:
+            return   # resolve the PV fault first
         self.proceed_btn.setEnabled(False)
         self.proceed_btn.setVisible(False)
         if self._worker:
             self._worker.confirm()
 
+    # ── PV fault UI ───────────────────────────────────────────
+
+    def _set_fault_banner(self, state, pv=""):
+        """state: "" hidden | "pending" amber | "paused" red.
+
+        The amber state is honest about latency: a CA monitor has reported a
+        disconnect but the worker has not reached a safe point yet, so something
+        may still be moving. Red means the worker is genuinely blocked.
+        """
+        if not state:
+            self.fault_banner.setVisible(False)
+            return
+        paused = (state == "paused")
+        col = PAL["red"] if paused else PAL["amber"]
+        bg  = PAL["tag_red_bg"] if paused else PAL["tag_amber_bg"]
+        self.fault_banner.setStyleSheet(
+            f"background: {bg}; border: 1px solid {col}; border-radius: 4px;")
+        self.fault_tag.setText("PAUSED — PV FAULT" if paused
+                               else "FAULT DETECTED — pausing at next safe point…")
+        self.fault_tag.setStyleSheet(f"color: {col}; font-size: 11px; font-weight: 700;")
+        self.fault_pv_lbl.setText(pv)
+        self.fault_pv_lbl.setVisible(bool(pv))
+        self.fault_pv_lbl.setStyleSheet(
+            f"color: {col}; font-size: 10px; font-family: 'JetBrains Mono', monospace;")
+        self.fault_btn.setVisible(paused)
+        self.fault_banner.setVisible(True)
+
+    def show_pending_fault(self, pv_name):
+        """A live CA monitor saw a PV drop; the worker has not stopped yet."""
+        if self._running and not self._faulted:
+            self._set_fault_banner("pending", pv_name)
+
+    def _on_pv_fault(self, pv, context, reason):
+        self._faulted = True
+        self._fault_rows.append(
+            (pv, context, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        self.proceed_btn.setEnabled(False)
+        self._set_fault_banner("paused", pv)
+        if self._fault_dlg is not None:
+            # Never stack a second dialog — refresh the open one in place.
+            self._fault_dlg.refresh(self._fault_rows)
+            self._fault_dlg.set_busy(False)
+            return
+        self._open_fault_dialog()
+        QApplication.beep()
+
+    def _open_fault_dialog(self):
+        if self._fault_dlg is not None:
+            self._fault_dlg.raise_()
+            self._fault_dlg.activateWindow()
+            return
+        if not self._fault_rows:
+            return
+        dlg = PVFaultDialog(self._fault_rows, self.window())
+        dlg.retry_clicked.connect(self._fault_retry)
+        dlg.abort_clicked.connect(self._fault_abort)
+        dlg.finished.connect(self._on_fault_dlg_finished)
+        self._fault_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_fault_dlg_finished(self, _result):
+        # Dismissing the dialog does not resume anything: the worker is still
+        # blocked on its event. The banner keeps a way back in.
+        self._fault_dlg = None
+
+    def _fault_retry(self):
+        if self._worker:
+            self._worker.fault_retry()
+
+    def _fault_abort(self):
+        if self._worker:
+            self._worker.fault_abort()
+
+    def _on_pv_fault_cleared(self, _action):
+        self._clear_fault_ui()
+
+    def _on_paused_changed(self, paused):
+        if not paused:
+            self._set_fault_banner("")
+
+    def _clear_fault_ui(self):
+        self._faulted = False
+        self._fault_rows = []
+        if self._fault_dlg is not None:
+            dlg, self._fault_dlg = self._fault_dlg, None
+            dlg.close()
+        self._set_fault_banner("")
+
+    def _on_preflight_report(self, rows):
+        for label, pv, status in rows:
+            level = "ok" if status.startswith("ok") else (
+                "info" if status == "skipped" else "error")
+            self.log.append_log(f"    {label:<26} {pv or '(none)':<38} {status}", level)
+
     def _on_finished(self, success):
+        self._running = False
         self.start_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
         self.proceed_btn.setVisible(False)
+        self.skip_mirror_chk.setEnabled(True)
+        self.confirm_chk.setEnabled(True)
+        self._clear_fault_ui()
+        if not success:
+            # Otherwise the step that was interrupted sits on "Running…" forever.
+            for step_num, info in self._step_row_info.items():
+                if info["tag"].text().startswith("Running"):
+                    self._set_step_ui(step_num, "error")
+                    self.beam_path.update_step(step_num, "error")
         if self._thread:
             self._thread.quit()
             self._thread.wait()
         self.alignment_done.emit(success)
 
     def _reset_ui(self):
+        self._clear_fault_ui()
         for step_num in self._step_row_info:
             self._set_step_ui(step_num, "idle")
         for step in range(1, 6):
@@ -3010,6 +4005,7 @@ class MirrorTab(QWidget):
             ("mir_vfm_stop",       "VFM scan stop offset",  QDoubleSpinBox,  0., 5000.,   250.,  1),
             ("mir_vfm_steps",      "VFM scan steps",        QSpinBox,        3,    200,    21,   0),
             ("mir_slit_size_c",    "Slit size after 4E (mm)", QDoubleSpinBox, 0.01, 20.0,  2.0,  3),
+            ("jjc_size_pre_feedback", "JJC size before feedback (mm)", QDoubleSpinBox, 0.0, 20.0, 0.4, 3),
         ]
         for r, (key, lbl, cls, mn, mx, dflt, dec) in enumerate(mir_scan_defs, start=1):
             scan_lay.addWidget(QLabel(lbl), r, 0)
@@ -3083,7 +4079,10 @@ class MirrorTab(QWidget):
         if r >= len(self._mirror_stages):
             return
         key = ["name", "pv", "val_in", "val_out"][c]
-        text = self._mirror_table.item(r, c).text()
+        item = self._mirror_table.item(r, c)
+        if item is None:
+            return
+        text = item.text()
         if key in ("val_in", "val_out"):
             try:
                 self._mirror_stages[r][key] = float(text)
@@ -3199,8 +4198,19 @@ class MirrorTab(QWidget):
         return out
 
     def apply_config(self, cfg):
+        """Apply a saved config. Returns the keys that could not be applied."""
+        bad = []
         if "mirror_stages" in cfg:
-            self._mirror_stages = [dict(s) for s in cfg["mirror_stages"]]
+            # val_in/val_out are written straight to motors, so they must be
+            # numbers even if the JSON carried strings.
+            self._mirror_stages = [
+                {**dict(st),
+                 "name":    str(st.get("name", "")),
+                 "pv":      str(st.get("pv", "")),
+                 "val_in":  coerce_float(st.get("val_in", 0.0)),
+                 "val_out": coerce_float(st.get("val_out", 0.0))}
+                for st in cfg["mirror_stages"]
+            ]
             self._mirror_table.blockSignals(True)
             self._mirror_table.setRowCount(len(self._mirror_stages))
             for r, stage in enumerate(self._mirror_stages):
@@ -3212,11 +4222,15 @@ class MirrorTab(QWidget):
                 continue
             w = self._scan_fields[k]
             if isinstance(w, (QDoubleSpinBox, QSpinBox)):
-                w.setValue(v)
+                if not set_spin_value(w, v):
+                    bad.append(k)
             elif isinstance(w, QComboBox):
                 idx = w.findText(str(v))
                 if idx >= 0:
                     w.setCurrentIndex(idx)
+                else:
+                    bad.append(k)
+        return bad
 
 
 # ─── Main Window ─────────────────────────────────────────────────────────────
@@ -3302,7 +4316,10 @@ class RecordTab(QWidget):
     def _on_pv_cell_changed(self, r, c):
         if c == 0 or r >= len(self._pv_config):
             return
-        text = self._pv_table.item(r, c).text()
+        item = self._pv_table.item(r, c)
+        if item is None:
+            return
+        text = item.text()
         if c == 1:
             if self._pv_config[r].get("locked", False):
                 return
@@ -3374,8 +4391,7 @@ class RecordTab(QWidget):
                 if val is None:
                     return (label, pv, "✗  timeout / not found")
                 if label == "XTAL":
-                    display = {0: "111", 1: "311"}.get(int(val), str(val))
-                    return (label, pv, f"✓  {display}")
+                    return (label, pv, f"✓  {fmt_xtal(val)}")
                 return (label, pv, f"✓  {val}")
             except Exception as exc:
                 return (label, pv, f"✗  {exc}")
@@ -3430,7 +4446,10 @@ class RecordTab(QWidget):
         dlg.exec()
 
     def get_checked_pvs(self):
-        return [{"label": e["label"], "pv": e["pv"]}
+        # "source" must be carried through: _on_alignment_done uses it to tell
+        # computed scan results apart from real PVs. Dropping it meant the six
+        # scan_result rows were never written to the lookup table.
+        return [{"label": e["label"], "pv": e["pv"], "source": e.get("source", "")}
                 for e in self._pv_config if e["checked"]]
 
     def get_pv_config(self):
@@ -3443,7 +4462,10 @@ class RecordTab(QWidget):
 
 
 class MainWindow(QMainWindow):
-    _bpm_polled = pyqtSignal(float, float, float)
+    _bpm_polled       = pyqtSignal(float, float, float)
+    _bpm_disconnected = pyqtSignal(str, str)   # (key, pv_name)
+
+    _BPM_KEYS = ("bpm_x", "bpm_y", "bpm_intensity")
 
     def __init__(self):
         super().__init__()
@@ -3485,6 +4507,7 @@ class MainWindow(QMainWindow):
 
         theme_lbl = QLabel("Theme:")
         theme_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
+        self._theme_lbl = theme_lbl
         self._theme_combo = QComboBox()
         self._theme_combo.addItems(list(THEMES.keys()))
         self._theme_combo.setFixedWidth(130)
@@ -3528,19 +4551,28 @@ class MainWindow(QMainWindow):
 
         self._auto_load_config()
 
-        self.setup_tab.changed.connect(self._save_config)
-        self.energy_tab.changed.connect(self._save_config)
-        self.mirror_tab.changed.connect(self._save_config)
-        self.record_tab.changed.connect(self._save_config)
+        # `changed` fires on every keystroke and every spinbox tick, so debounce
+        # rather than rewriting the whole config file each time.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(800)
+        self._save_timer.timeout.connect(self._save_config)
+        for tab in (self.setup_tab, self.energy_tab, self.mirror_tab, self.record_tab):
+            tab.changed.connect(self._schedule_save)
         self.alignment_tab.alignment_done.connect(self._on_alignment_done)
 
         # Continuous BPM monitor via EPICS CA subscriptions
         self._bpm_monitored = {}  # "bpm_x"/"bpm_y"/"bpm_intensity" → epics.PV
         self._bpm_vals      = {"bpm_x": 0.0, "bpm_y": 0.0, "bpm_intensity": 0.0}
+        self._bpm_names     = {}  # last-subscribed names, to avoid pointless churn
+        self._resubscribing = set()
         self._bpm_polled.connect(self.alignment_tab._on_bpm_update)
         self.setup_tab.sim_check.toggled.connect(self._on_sim_toggled_bpm)
-        # Re-subscribe when PV names change
+        # Re-subscribe when a BPM PV name actually changes
         self.setup_tab.changed.connect(self._refresh_bpm_monitors)
+        # Route live-monitor disconnects into the alignment fault handler
+        self._bpm_disconnected.connect(self._on_monitor_disconnect)
+        self.setup_tab.pv_disconnected.connect(self._on_monitor_disconnect)
         if EPICS_AVAILABLE and not self.setup_tab.is_simulate():
             self._start_bpm_monitoring()
 
@@ -3575,13 +4607,11 @@ class MainWindow(QMainWindow):
                     import epics as _epics
                     if label in _STRING_LABELS:
                         val = _epics.caget(pv, as_string=True)
-                        row[label] = str(val) if val is not None else "—"
+                        row[label] = "—" if val is None else str(val)
                     elif label == "XTAL":
-                        val = _epics.caget(pv)
-                        row[label] = {0: "111", 1: "311"}.get(int(val), str(val)) if val is not None else "—"
+                        row[label] = fmt_xtal(_epics.caget(pv))
                     else:
-                        val = _epics.caget(pv)
-                        row[label] = f"{val:.6g}" if isinstance(val, (int, float)) else str(val) if val is not None else "—"
+                        row[label] = fmt_pv_value(_epics.caget(pv))
                 except Exception:
                     row[label] = "err"
         self.energy_tab.append_record_row(row)
@@ -3595,9 +4625,7 @@ class MainWindow(QMainWindow):
         self.alignment_tab._refresh_start_btn()
         self.alignment_tab._refresh_abort_btn()
         # Refresh readback label styles on next PV update (they read PAL live)
-        # Force-refresh topbar theme label color
-        self._theme_combo.parentWidget().findChild(
-            type(QLabel()), "").setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
+        self._theme_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
 
     def _auto_load_config(self):
         if not os.path.exists(AUTO_CONFIG_PATH):
@@ -3605,10 +4633,10 @@ class MainWindow(QMainWindow):
         try:
             with open(AUTO_CONFIG_PATH) as f:
                 cfg = json.load(f)
-            self.setup_tab._apply_config(cfg)
+            bad = list(self.setup_tab._apply_config(cfg) or [])
             if "energy_table" in cfg:
                 self.energy_tab.set_table_data(cfg["energy_table"])
-            self.mirror_tab.apply_config(cfg)
+            bad += list(self.mirror_tab.apply_config(cfg) or [])
             if "record_pv_config" in cfg:
                 self.record_tab.set_pv_config(cfg["record_pv_config"])
             if "record_data" in cfg:
@@ -3617,7 +4645,12 @@ class MainWindow(QMainWindow):
                 idx = self._theme_combo.findText(cfg["theme"])
                 if idx >= 0:
                     self._theme_combo.setCurrentIndex(idx)
-            self.status.showMessage(f"Config restored from {AUTO_CONFIG_PATH}")
+            if bad:
+                self.status.showMessage(
+                    f"Config restored from {AUTO_CONFIG_PATH} — "
+                    f"could not apply: {', '.join(sorted(set(bad)))}")
+            else:
+                self.status.showMessage(f"Config restored from {AUTO_CONFIG_PATH}")
         except Exception as e:
             self.status.showMessage(f"Could not restore config: {e}")
 
@@ -3645,25 +4678,34 @@ class MainWindow(QMainWindow):
         else:
             self._start_bpm_monitoring()
 
+    def _mark_resubscribing(self, pv_name):
+        """Suppress the disconnect callback caused by our own teardown."""
+        name = (pv_name or "").strip()
+        if not name:
+            return
+        self._resubscribing.add(name)
+        QTimer.singleShot(3000, lambda n=name: self._resubscribing.discard(n))
+
     def _start_bpm_monitoring(self):
         import epics as _epics
         pvs = self.setup_tab.get_pvs()
-        BPM_KEYS = ("bpm_x", "bpm_y", "bpm_intensity")
-        for key in BPM_KEYS:
+        for key in self._BPM_KEYS:
             old = self._bpm_monitored.pop(key, None)
             if old is not None:
                 try:
+                    self._mark_resubscribing(getattr(old, "pvname", ""))
                     old.disconnect()
                 except Exception:
                     pass
-            pv_name = pvs.get(key, "").strip()
+            pv_name = (pvs.get(key, "") or "").strip()
+            self._bpm_names[key] = pv_name
             if not pv_name:
                 continue
 
             def _cb(value=None, pvname=None, bk=key, **_kw):
-                # Skip updates while alignment worker owns BPM display
-                if self.alignment_tab.abort_btn.isEnabled():
-                    return
+                # libca callback thread — read a plain bool, never a Qt widget.
+                if self.alignment_tab._running:
+                    return   # the worker owns the BPM display during a run
                 if value is None:
                     return
                 try:
@@ -3676,8 +4718,13 @@ class MainWindow(QMainWindow):
                     self._bpm_vals["bpm_intensity"],
                 )
 
+            def _conn(pvname=None, conn=None, bk=key, nm=pv_name, **_kw):
+                if not conn:
+                    self._bpm_disconnected.emit(bk, nm)
+
             try:
-                pv = _epics.PV(pv_name, callback=_cb, auto_monitor=True)
+                pv = _epics.PV(pv_name, callback=_cb, connection_callback=_conn,
+                               auto_monitor=True)
                 self._bpm_monitored[key] = pv
             except Exception:
                 pass
@@ -3685,17 +4732,96 @@ class MainWindow(QMainWindow):
     def _stop_bpm_monitoring(self):
         for pv in self._bpm_monitored.values():
             try:
+                self._mark_resubscribing(getattr(pv, "pvname", ""))
                 pv.disconnect()
             except Exception:
                 pass
         self._bpm_monitored.clear()
+        self._bpm_names.clear()
 
     def _refresh_bpm_monitors(self):
-        """Re-subscribe BPM PVs when setup changes (debounced by Qt signal coalescing)."""
-        if EPICS_AVAILABLE and not self.setup_tab.is_simulate():
-            self._start_bpm_monitoring()
+        """Re-subscribe only when a BPM PV name actually changed.
+
+        `setup_tab.changed` also fires for scan-parameter spinboxes. Rebuilding
+        the CA connections on every one of those produced a stream of spurious
+        disconnect callbacks, which the fault router would take seriously.
+        """
+        if not (EPICS_AVAILABLE and not self.setup_tab.is_simulate()):
+            return
+        pvs = self.setup_tab.get_pvs()
+        names = {k: (pvs.get(k, "") or "").strip() for k in self._BPM_KEYS}
+        if names == self._bpm_names:
+            return
+        self._start_bpm_monitoring()
+
+    def _schedule_save(self):
+        self._save_timer.start()
+
+    # ── live-monitor disconnect routing ───────────────────────────────
+
+    def _active_worker(self):
+        """The worker of a hardware run that is actually in progress, else None.
+
+        Judged by the mode the run *started* with, not the live checkbox: the
+        operator can flip Simulation mid-run, and that must not change how an
+        in-flight hardware run is policed.
+        """
+        worker = self.alignment_tab._worker
+        if worker is None or not self.alignment_tab._running or worker.simulate:
+            return None
+        return worker
+
+    def _is_self_inflicted(self, pv_name):
+        return (pv_name in self._resubscribing
+                or pv_name in self.setup_tab._resubscribing)
+
+    def _on_monitor_disconnect(self, key, pv_name):
+        if self._active_worker() is None:
+            # Idle: surface it, but do not interrupt anything.
+            self.status.showMessage(f"PV disconnected: {pv_name}", 8000)
+            return
+        if self._is_self_inflicted(pv_name):
+            return
+        # Absorb IOC reboots and gateway blips before stopping a 20-minute run.
+        QTimer.singleShot(2000, lambda: self._confirm_disconnect(key, pv_name))
+
+    def _confirm_disconnect(self, key, pv_name):
+        worker = self._active_worker()
+        if worker is None or self._is_self_inflicted(pv_name):
+            return
+        pv = self._bpm_monitored.get(key) or self.setup_tab._monitored_pvs.get(key)
+        if pv is not None and getattr(pv, "connected", False):
+            return   # it came back on its own
+        try:
+            active = worker.active_pv_set()
+        except Exception:
+            active = set()
+        if active and pv_name not in active and pv_name.split(".")[0] not in active:
+            return   # this run never touches that PV
+        if worker._paused or worker._pause_requested:
+            return   # already faulting
+        self.alignment_tab.show_pending_fault(pv_name)
+        worker.external_fault(pv_name, f"live PV monitor ({key})",
+                              "channel access connection lost during the run")
 
     def closeEvent(self, event):
+        if self.alignment_tab._running and self.alignment_tab._worker is not None:
+            reply = QMessageBox.question(
+                self, "Alignment in progress",
+                "An alignment sequence is still running.\n"
+                "Abort it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            # Otherwise the worker thread keeps driving motors after the window
+            # has gone.
+            self.alignment_tab.abort_alignment()
+            thread = self.alignment_tab._thread
+            if thread is not None:
+                thread.quit()
+                thread.wait(5000)
         self._stop_bpm_monitoring()
         self.setup_tab._stop_monitoring()
         self._save_config()
@@ -3713,6 +4839,11 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Alignment running…")
         self.alignment_tab._worker.finished.connect(
             lambda ok: self.status.showMessage("Alignment complete ✓" if ok else "Alignment aborted")
+        )
+        self.alignment_tab._worker.paused_changed.connect(
+            lambda paused: self.status.showMessage(
+                "PAUSED — PV fault: respond in the fault dialog" if paused
+                else "Alignment running…")
         )
 
 
