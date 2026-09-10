@@ -16,6 +16,10 @@ qapp = H.qapp()
 win = app.MainWindow()
 win.show()
 
+# DEFAULT_PVS leaves mir_piezo_pitch blank, and the sequence correctly skips 4C
+# and 5C when it is unconfigured. Fill it in so a run exercises all nine scans.
+win.setup_tab._pv_fields["mir_piezo_pitch"].setText("SIM:mirror:piezo:pitch")
+
 
 def run_sequence(skip_mirror, confirm):
     """Run one full sequence to completion. Returns the success flag, or None on timeout."""
@@ -111,6 +115,46 @@ for skip in (True, False):
                     % (target, ", ".join(str(v) for v in early) or "no earlier writes", tag))
 
 app.EpicsInterface.put = _real_put
+
+# ── Figure routing. The loop above ended on a skip_mirror=False run, so every
+#    figure should be populated and the two overlay pairs should each hold two
+#    traces. "pitch" used to be one key shared by the DCM pitch motor and the
+#    DCM pitch piezo, concatenating incompatible x scales into one polyline.
+board = win.alignment_tab._plot_board
+
+for fig_id, expected in (("dcm_pitch", 2), ("mir_piezo", 2)):
+    got = len(board.model(fig_id).order())
+    R.check(got == expected,
+            "figure %r carries %d overlaid traces (got %d)" % (fig_id, expected, got))
+
+empty = [f[0] for f in app._FIGURE_DEFS if board.model(f[0]).is_empty()]
+R.check(not empty,
+        "every figure received its scan%s" % (" (empty: %s)" % empty if empty else ""))
+
+labels = sorted(sr.label for f in app._FIGURE_DEFS
+                for sr in board.model(f[0]).order())
+R.check(len(labels) == len(set(labels)) == 9,
+        "all nine scans are separately labelled: %s" % labels)
+
+colours_ok = all(len({sr.color for sr in board.model(f[0]).order()})
+                 == len(board.model(f[0]).order()) for f in app._FIGURE_DEFS)
+R.check(colours_ok, "traces sharing a figure have distinct colours")
+
+unsorted_series = [sr.label for f in app._FIGURE_DEFS
+                   for sr in board.model(f[0]).order()
+                   if any(b < a for a, b in zip(sr.xs, sr.xs[1:]))]
+R.check(not unsorted_series,
+        "every trace is monotonic in x%s"
+        % (" (zig-zag: %s)" % unsorted_series if unsorted_series else ""))
+
+R.check(all(len(sr.raw) == len(sr.xs) for f in app._FIGURE_DEFS
+            for sr in board.model(f[0]).order()),
+        "acquisition order is preserved alongside the sorted draw order")
+
+snap = board.snapshot()
+R.check(isinstance(snap, dict) and len(snap.get("figures", [])) == 7
+        and snap.get("meta", {}).get("row"),
+        "snapshot() returns the run as plain data for a future history tab")
 
 # _apply_theme used to reach for the theme label with findChild(QLabel, ""),
 # which could return None.

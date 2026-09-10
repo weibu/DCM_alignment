@@ -50,6 +50,39 @@ Note that `mirror_in_out.docx` lists 0.4 as the JJC Size *in* value. That is the
 post-alignment value; using it as the mirror-in value would close the slit
 during Step 4. The mirror-stage default is therefore 4 for both in and out.
 
+## Scan Figures
+
+The figure area has two levels of tabs. The outer level picks the **device** —
+DCM or Mirror — and inside each device there are two side-by-side panes, each
+with its own tab bar, so you can view any two of that device's figures at once.
+
+| Device | Figure | x axis | Traces |
+|--------|--------|--------|--------|
+| DCM | Pitch motor | µrad | 3B coarse **and** 3D fine, overlaid |
+| DCM | Roll | µrad | 3C |
+| DCM | Pitch piezo | DCOM | 5B |
+| Mirror | Slit | mm | 4A |
+| Mirror | Mirror piezo | DCOM | 4C **and** 5C, overlaid |
+| Mirror | VDM:Y | µm | 4D |
+| Mirror | VFM:Y | µm | 4E |
+
+The piezo scans have their own figures because their x axis is a DCOM demand of
+order 5, not a motor position of order 1300 — putting them on the same axis as
+the motor scans made both unreadable.
+
+Each scan added to a figure gets its own colour, its own legend entry and its
+own peak/zero marker in the matching colour. Trace colours are fixed and do not
+change with the theme, so a colour means the same trace in every screenshot.
+
+**Follow scan** (top right of the device tabs) brings the running scan's figure
+forward in the *left* pane and switches the device tab to match. The right pane
+is always yours. If you pick a tab yourself during a run, Follow switches itself
+off so the app stops moving the view; it re-arms at the start of the next run,
+when you click Proceed, or when you tick the box again. A figure that received a
+scan while hidden is marked with a ● on its tab.
+
+Figures clear at the start of each run.
+
 ## PV Fault Handling
 
 The sequence never guesses. Any PV read that comes back `None` — a disconnected
@@ -77,6 +110,24 @@ because the worker thread is blocked, so you can still watch the live readouts,
 the plots and the log, and switch to the Setup tab to diagnose. Closing the
 dialog does **not** resume — the run stays paused and a red
 `Review fault…` button reopens it.
+
+**Motion is never timed out.** A stage is allowed to take as long as it takes —
+CRL Y needs about a minute for its in/out travel and a large Mono E change takes
+several minutes. Completion is read from the motor record itself (`.DMOV`,
+`.DIFF` against `.RDBD`, `.MISS`, `.LVIO`, the `MSTA` problem bits), and PVs are
+classified as motor or plain records at pre-flight by whether their `.DMOV`
+connects. Three things are timed, and all of them mean *no confirmation
+arrived*, not *this is taking a while*:
+
+| Setup parameter | Default | Fires when |
+|---|---|---|
+| PV write ack timeout | 10 s | A plain record's put-callback never came back |
+| Motor start grace | 5 s | The setpoint was accepted but the motor never started |
+| Motor stall timeout | 30 s | `.DMOV` says moving but `.RBV` has stopped advancing |
+
+The mirror stages and the undulator are now genuinely waited for: all setpoints
+are issued first so the stages travel concurrently, then each is awaited, and
+Step 3 does not begin until the undulator's busy flag clears.
 
 **Live monitors.** While a run is in progress, a PV that drops out between reads
 is caught by its channel-access connection callback and pauses the sequence at

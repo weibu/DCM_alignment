@@ -29,12 +29,23 @@ app.describe_pv = lambda pv, timeout=2.0: (
     STATE["described"].append(pv) or "stub diagnostic for %s: NOT CONNECTED" % pv)
 
 
+# A settled motor record: done, on target, no problem bits.
+_SETTLED = ((".DMOV", 1.0), (".MOVN", 0.0), (".MSTA", 2.0), (".LVIO", 0.0),
+            (".MISS", 0.0), (".DIFF", 0.0), (".RDBD", 0.01), (".MRES", 0.001))
+_IDLE_PVS = {app.DEFAULT_PVS["und_busy"]: 0.0}      # undulator not moving
+
+
 def fake_get(self, pv, as_string=False, timeout=3.0):
     if self.simulate:
         return self._sim_vals.get(pv, 0.0)
     if not STATE["get_ok"]:
         return None
-    return 1.0 if pv.endswith(".DMOV") else 0.5
+    if pv in _IDLE_PVS:
+        return _IDLE_PVS[pv]
+    for suffix, val in _SETTLED:
+        if pv.endswith(suffix):
+            return val
+    return 0.5
 
 
 def fake_put(self, pv, value, wait=True, timeout=30.0):
@@ -132,5 +143,91 @@ if R.check(H.pump(lambda: tab._fault_dlg is not None),
     R.check(not tab.fault_banner.isVisible(), "the banner clears after abort")
     R.check(any(i["tag"].text() == "Error" for i in tab._step_row_info.values()),
             "the interrupted step is marked Error rather than left Running")
+
+# ═══ 3. Motion completion: no wall-clock cap, but stalls are caught ════════
+# Exercised directly on a worker rather than through a whole sequence: these
+# are timing properties of _wait_motor_done, and a real run would take minutes.
+import time
+
+MOTOR = "FAKE:m1"
+
+
+def make_worker(stall=2.0, grace=2.0):
+    params = dict(app.DEFAULT_SCAN)
+    params.update({"motor_stall_timeout": stall, "motor_start_grace": grace})
+    w = app.AlignmentWorker(dict(app.DEFAULT_PVS), params,
+                            dict(app.DEFAULT_LOOKUP[0]), simulate=False)
+    w._is_motor[MOTOR] = True          # skip the .DMOV probe
+    return w
+
+
+def drive(w, dmov_fn, rbv_fn, diff=0.0):
+    """Point the worker's transport at a scripted motor."""
+    def get(pv, as_string=False, timeout=3.0):
+        if pv.endswith(".DMOV"):
+            return dmov_fn()
+        if pv.endswith(".RBV"):
+            return rbv_fn()
+        if pv.endswith(".RDBD"):
+            return 0.01
+        if pv.endswith(".MRES"):
+            return 0.001
+        if pv.endswith(".DIFF"):
+            return diff
+        return 0.0                     # MSTA, LVIO, MISS all clean
+    w.epics.get = get
+
+
+# -- a slow but healthy motor must NOT fault, even past the stall timeout ----
+STALL, MOVING_FOR = 2.0, 5.0           # move lasts 2.5x the stall timeout
+w = make_worker(stall=STALL)
+t0 = time.time()
+drive(w,
+      dmov_fn=lambda: 0.0 if time.time() - t0 < MOVING_FOR else 1.0,
+      rbv_fn=lambda: (time.time() - t0) * 1.0)      # advancing steadily
+faults = []
+w.pv_fault.connect(lambda pv, c, r: faults.append((pv, r)))
+started = time.time()
+ok = w._wait_motor_done(MOTOR)
+elapsed = time.time() - started
+R.check(ok is True and not faults,
+        "a %.0fs move with a %.0fs stall timeout does not fault while .RBV advances"
+        % (MOVING_FOR, STALL))
+R.check(elapsed >= MOVING_FOR,
+        "the wait lasted the whole move rather than timing out (%.1fs)" % elapsed)
+
+# -- a motor that reports moving but stops advancing IS caught --------------
+w2 = make_worker(stall=1.5)
+drive(w2, dmov_fn=lambda: 0.0, rbv_fn=lambda: 42.0)  # frozen encoder
+caught = []
+w2.pv_fault.connect(lambda pv, c, r: (caught.append((pv, c, r)), w2.fault_abort()))
+started = time.time()
+try:
+    w2._wait_motor_done(MOTOR)
+    raised = False
+except app.PVFaultAbort:
+    raised = True
+elapsed = time.time() - started
+R.check(raised, "a frozen encoder while .DMOV says moving raises a fault")
+if caught:
+    pv, _ctx, reason = caught[0]
+    R.check(pv == MOTOR, "the stall fault names the motor: %r" % pv)
+    R.check("has not advanced" in reason, "the reason describes the stall: %r" % reason)
+R.check(1.4 <= elapsed <= 5.0,
+        "the stall was caught close to the configured timeout (%.1fs)" % elapsed)
+
+# -- a setpoint the motor never acts on is caught by the start grace --------
+w3 = make_worker(grace=1.0)
+drive(w3, dmov_fn=lambda: 1.0, rbv_fn=lambda: 0.0, diff=5.0)  # done, but off target
+caught3 = []
+w3.pv_fault.connect(lambda pv, c, r: (caught3.append(r), w3.fault_abort()))
+try:
+    w3._wait_motor_done(MOTOR)
+    raised3 = False
+except app.PVFaultAbort:
+    raised3 = True
+R.check(raised3 and caught3 and "has not started" in caught3[0],
+        "a setpoint the motor never acts on is caught by the start grace: %r"
+        % (caught3[0] if caught3 else None))
 
 R.finish()

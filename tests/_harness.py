@@ -82,10 +82,25 @@ class Report:
 
     def finish(self):
         print()
+        code = 0
         if self.failures:
             print("FAILURES:")
             for f in self.failures:
                 print("  -", f)
-            sys.exit(1)
-        print("ALL TESTS PASSED")
-        sys.exit(0)
+            code = 1
+        else:
+            print("ALL TESTS PASSED")
+        _hard_exit(code)
+
+
+def _hard_exit(code):
+    """Exit immediately, bypassing interpreter shutdown.
+
+    A plain sys.exit() can hang here: the tests leave a live QApplication and,
+    with pyepics loaded, open channel-access connections whose teardown does not
+    always complete. The result has already been printed, so there is nothing
+    to lose by skipping atexit and thread joins.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

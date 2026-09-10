@@ -17,6 +17,7 @@ Optional EPICS support (pyepics):
 
 import sys
 import time
+import bisect
 import csv
 import json
 import os
@@ -92,6 +93,20 @@ THEMES = {
     },
 }
 PAL = dict(THEMES["Ocean Light"])
+
+# Trace colours for scan plots. Deliberately NOT drawn from PAL: a trace's
+# colour is its identity in the legend and must not change meaning when the
+# operator switches theme (PAL["cyan"] is teal in Ocean Light, blue in Slate
+# Blue and yellow in Carbon). Each of these reads against both the lightest
+# app background (#f5f7fa) and the darkest (#0d1117).
+SERIES_COLORS = [
+    "#3b82f6",   # blue
+    "#e8590c",   # orange
+    "#099268",   # green
+    "#ae3ec9",   # purple
+    "#1098ad",   # teal
+    "#e64980",   # pink
+]
 
 
 def build_qss(pal):
@@ -381,6 +396,8 @@ DEFAULT_PVS = {
     "feedback_v":       "BPM:feedback:V:enable",
     "und_harmonic":     "",
     "und_start":        "",
+    "und_busy":         "S15ID:USID:BusyM",
+    "und_energy_rbv":   "S15ID:USID:EnergyM",
     "mir_slit_top":     "15IDA:m9",
     "mir_slit_bot":     "15IDA:m10",
     "mir_piezo_pitch":  "",
@@ -548,6 +565,9 @@ DEFAULT_SCAN = {
     "roll_steps":   21,
     "settle_time":        0.1,
     "piezo_settle_time":  0.2,
+    "pv_ack_timeout":       10.0,
+    "motor_start_grace":     5.0,
+    "motor_stall_timeout":  30.0,
     "piezo_center": 5.0,
     "smart_edge_fraction":    0.2,
     "smart_max_extend_steps": 10,
@@ -850,8 +870,8 @@ class PVFaultAbort(Exception):
 class AlignmentWorker(QObject):
     log_signal       = pyqtSignal(str, str)   # (message, level)
     step_status      = pyqtSignal(int, str)   # (step_num, status)
-    scan_point       = pyqtSignal(str, float, float)  # (motor, x, y)
-    scan_peak        = pyqtSignal(str, float)          # (motor, peak_x)
+    scan_point       = pyqtSignal(str, float, float)  # (substep_key, x, y)
+    scan_peak        = pyqtSignal(str, float)          # (substep_key, peak_x)
     bpm_update       = pyqtSignal(float, float, float) # x, y, intensity
     feedback_update  = pyqtSignal(bool, bool)          # h, v
     substep_status   = pyqtSignal(str, str)            # (key "step_sub", status)
@@ -888,6 +908,8 @@ class AlignmentWorker(QObject):
         self._pending_fault   = None    # (pv, context, reason) from a CA monitor
         self._faulted_pvs     = set()   # distinct PVs that have faulted this run
         self._ca_hint_shown   = False
+        self._is_motor        = {}      # pv name -> bool, filled by pre-flight
+        self._deadbands       = {}      # motor pv -> arrival tolerance
         self.epics = EpicsInterface(simulate=simulate)
 
     def abort(self):
@@ -908,29 +930,173 @@ class AlignmentWorker(QObject):
     def log(self, msg, level="info"):
         self.log_signal.emit(msg, level)
 
-    def _wait_motor_done(self, motor_pv, timeout=30.0):
-        """Block until the motor reports done. Returns False only on abort.
+    def _motor_deadband(self, motor_pv):
+        """Arrival tolerance for a motor, taken from its own .RDBD / .MRES."""
+        if motor_pv in self._deadbands:
+            return self._deadbands[motor_pv]
+        vals = []
+        for field in (".RDBD", ".MRES"):
+            v = self.epics.get(motor_pv + field)
+            try:
+                vals.append(abs(float(v)))
+            except (TypeError, ValueError):
+                pass
+        db = max(vals) if vals else 0.0
+        self._deadbands[motor_pv] = max(db, 1e-9)
+        return self._deadbands[motor_pv]
 
-        Previously this returned True after the timeout, so the caller believed
-        the move had succeeded and every `if not self._wait_motor_done(...)`
-        guard was dead code on the failure path. A stalled motor and an
-        unreadable .DMOV are now both operator-visible faults.
+    def _motor_problem(self, motor_pv):
+        """Decode .MSTA / .LVIO into a human reason, or None if healthy.
+
+        Read with the raw accessor: not every record carries these fields, and
+        a missing one must not itself be a fault.
         """
-        if self.simulate:
-            return self._sleep(0.05)
-        context = f"waiting for {motor_pv} to finish moving"
+        try:
+            msta = int(self.epics.get(motor_pv + ".MSTA") or 0)
+        except (TypeError, ValueError):
+            msta = 0
+        flags = []
+        if msta & 0x200:          # PROBLEM
+            flags.append("the driver reports a problem (MSTA PROBLEM bit)")
+        if msta & 0x1000:         # COMM_ERR
+            flags.append("controller communication error (MSTA COMM_ERR bit)")
+        if self.epics.get(motor_pv + ".LVIO"):
+            flags.append("limit violation (.LVIO)")
+        return "; ".join(flags) if flags else None
+
+    def _verify_arrival(self, motor_pv, context, deadband):
+        """Confirm the motor actually reached its target. Blocks on a fault."""
         while True:
-            t0 = time.time()
-            while time.time() - t0 < timeout:
-                self._pause_point()
-                if self._abort:
-                    return False
-                if self._read_dmov(motor_pv, context):
-                    return True
-                time.sleep(0.05)
-            if self._fault(motor_pv, context,
-                           f"motor did not report done (.DMOV) within {timeout:.0f}s") == "abort":
+            diff = self._read_float(motor_pv + ".DIFF", context)
+            miss = self.epics.get(motor_pv + ".MISS")
+            if not miss and abs(diff) <= deadband:
+                return True
+            rbv = self._read_float(motor_pv + ".RBV", context)
+            val = self._read_float(motor_pv + ".VAL", context)
+            reason = ("stopped at %.6g but the target is %.6g (.DIFF = %.6g, "
+                      "deadband %.6g%s)" % (rbv, val, diff, deadband,
+                                            ", .MISS is set" if miss else ""))
+            if self._fault(motor_pv, context, reason) == "abort":
                 raise PVFaultAbort(motor_pv, context)
+
+    def _wait_motor_done(self, motor_pv):
+        """Block until the motor finishes moving. Returns False only on abort.
+
+        There is deliberately NO cap on how long the motion may take: CRL Y
+        needs ~60 s for its in/out travel and a large Mono E change takes
+        several minutes. Timeouts apply only to *absence of confirmation* — a
+        field that will not read, a setpoint the motor never acts on, or an
+        encoder that stops advancing while the record still claims to be
+        moving. All of those go through the normal fault dialog.
+        """
+        name = (motor_pv or "").strip()
+        if self.simulate or not name:
+            return self._sleep(0.05)
+        if not self._pv_is_motor(name):
+            return True   # plain record: the put-callback was the confirmation
+        context = f"waiting for {name} to finish moving"
+        grace    = float(self.params.get("motor_start_grace", 5.0))
+        stall    = float(self.params.get("motor_stall_timeout", 30.0))
+        deadband = self._motor_deadband(name)
+        t0 = last_progress = time.time()
+        last_rbv = self._read_float(name + ".RBV", context)
+        started  = False
+        ticks    = 0
+        while True:
+            self._pause_point()
+            if self._abort:
+                return False
+            dmov = self._read_float(name + ".DMOV", context)
+            rbv  = self._read_float(name + ".RBV", context)
+            if abs(rbv - last_rbv) > deadband:
+                last_rbv, last_progress = rbv, time.time()
+
+            # MSTA/LVIO change slowly; no need to read them at the poll rate.
+            ticks += 1
+            problem = self._motor_problem(name) if ticks % 10 == 1 else None
+            if problem:
+                if self._fault(name, context, problem) == "abort":
+                    raise PVFaultAbort(name, context)
+                t0 = last_progress = time.time()   # operator retried; restart the clocks
+                started = False
+                continue
+
+            if not dmov:
+                started = True
+                if time.time() - last_progress > stall:
+                    if self._fault(name, context,
+                                   "reports moving but .RBV has not advanced for "
+                                   "%gs (stuck at %.6g)" % (stall, rbv)) == "abort":
+                        raise PVFaultAbort(name, context)
+                    t0 = last_progress = time.time()
+                    started = False
+            else:
+                diff = self._read_float(name + ".DIFF", context)
+                if started or abs(diff) <= deadband:
+                    return self._verify_arrival(name, context, deadband)
+                if time.time() - t0 > grace:
+                    if self._fault(name, context,
+                                   "setpoint accepted but the motor has not started "
+                                   "within %gs (.DIFF = %.6g)" % (grace, diff)) == "abort":
+                        raise PVFaultAbort(name, context)
+                    t0 = last_progress = time.time()
+            time.sleep(0.05)
+
+    def _wait_undulator(self):
+        """Block until the undulator reports it has reached the new energy.
+
+        Same shape as _wait_motor_done: no cap on travel time, only on absence
+        of progress. A multi-keV gap change takes tens of seconds, and the
+        Step 3 pitch scan is meaningless until the undulator lands.
+        """
+        busy_pv = (self.pvs.get("und_busy") or "").strip()
+        if self.simulate or not busy_pv:
+            return True
+        rbv_pv  = (self.pvs.get("und_energy_rbv") or "").strip()
+        context = "waiting for the undulator to reach its new energy"
+        grace   = float(self.params.get("motor_start_grace", 5.0))
+        stall   = float(self.params.get("motor_stall_timeout", 30.0))
+        t0 = last_progress = time.time()
+        last_e  = self._read_float(rbv_pv, context) if rbv_pv else None
+        started = False
+        self.log("  Waiting for the undulator…")
+        while True:
+            self._pause_point()
+            if self._abort:
+                return False
+            busy = self._read_float(busy_pv, context)
+            if rbv_pv:
+                energy = self._read_float(rbv_pv, context)
+                if last_e is None or abs(energy - last_e) > 1e-4:
+                    last_e, last_progress = energy, time.time()
+            if busy:
+                started = True
+                if time.time() - last_progress > stall:
+                    if self._fault(busy_pv, context,
+                                   "the undulator reports busy but its energy readback "
+                                   "has not changed for %gs" % stall) == "abort":
+                        raise PVFaultAbort(busy_pv, context)
+                    t0 = last_progress = time.time()
+                    started = False
+            elif started or time.time() - t0 > grace:
+                self.log("  Undulator in position.", "ok")
+                return True
+            time.sleep(0.05)
+
+    def _wait_all_motors(self, pv_names, label="stages"):
+        """Await several stages that were all commanded before waiting.
+
+        Setpoints are issued first and awaited afterwards so the stages travel
+        concurrently rather than one after another.
+        """
+        pending = [p for p in dict.fromkeys(pv_names) if p and self._pv_is_motor(p)]
+        if not pending:
+            return True
+        self.log("  Waiting for %d %s to finish moving…" % (len(pending), label))
+        for pv in pending:
+            if not self._wait_motor_done(pv):
+                return False
+        return True
 
     def confirm(self):
         """Called from the UI thread when operator clicks Proceed."""
@@ -1086,14 +1252,28 @@ class AlignmentWorker(QObject):
                                f"read returned a non-numeric value ({value!r})") == "abort":
                     raise PVFaultAbort(name, context)
 
-    def _read_dmov(self, motor_pv, context):
-        """Read a motor .DMOV field. A None read is a fault, not a silent stall."""
-        return self._read_float(motor_pv + ".DMOV", context)
+    def _pv_is_motor(self, pv_name):
+        """True if this PV is an EPICS motor record, i.e. its .DMOV connects.
 
-    def _write(self, pv_name, value, context, wait=True):
-        """Checked PV write. Verifies the caput return code.
+        Classified in bulk during pre-flight; probed lazily if that was skipped.
+        """
+        name = (pv_name or "").strip()
+        if not name or self.simulate or not EPICS_AVAILABLE:
+            return False
+        if name not in self._is_motor:
+            ok, _detail = probe_pv(name + ".DMOV", timeout=1.0)
+            self._is_motor[name] = ok
+        return self._is_motor[name]
 
-        Raises PVFaultAbort if the operator aborts.
+    def _write(self, pv_name, value, context, wait=None):
+        """Checked PV write. Raises PVFaultAbort if the operator aborts.
+
+        Motor records get the setpoint with NO put-callback wait: on a motor
+        that callback does not fire until the move finishes, so a legitimately
+        slow stage (CRL Y takes ~60 s, a large Mono E move several minutes)
+        would look like a failed write. Their completion is tracked separately
+        by _wait_motor_done(). For a plain record the put-callback *is* the
+        write confirmation, and it should arrive promptly.
         """
         while True:
             self._pause_point()
@@ -1105,7 +1285,10 @@ class AlignmentWorker(QObject):
                     return   # no-op, matching the pre-existing simulation behaviour
                 reason = "no PV name is configured for this write"
             else:
-                ok, reason = self.epics.put(name, value, wait=wait)
+                use_wait = (not self._pv_is_motor(name)) if wait is None else wait
+                ok, reason = self.epics.put(
+                    name, value, wait=use_wait,
+                    timeout=float(self.params.get("pv_ack_timeout", 10.0)))
                 if ok:
                     return
                 if self.simulate:
@@ -1124,7 +1307,7 @@ class AlignmentWorker(QObject):
             return self.pvs.get("ion_chamber") or self.pvs.get("bpm_intensity", "")
         return self.pvs.get("bpm_intensity") or self.pvs.get("ion_chamber", "")
 
-    def _smart_scan_peak(self, scan_key, motor_pv, center, half_range, steps,
+    def _smart_scan_peak(self, motor_pv, center, half_range, steps,
                          sim_fn, substep_key):
         """Adaptive scan for intensity peak. Returns (peak_pos, sigma) or (None, None)."""
         p = self.params
@@ -1155,7 +1338,7 @@ class AlignmentWorker(QObject):
             if self.simulate:
                 scan_xs, scan_ys = sim_fn(a, b, n)
                 for x, y in zip(scan_xs, scan_ys):
-                    self.scan_point.emit(scan_key, float(x), float(y))
+                    self.scan_point.emit(substep_key, float(x), float(y))
                     xs_all.append(float(x)); ys_all.append(float(y))
             else:
                 scan_xs = list(np.linspace(a, b, n))
@@ -1167,7 +1350,7 @@ class AlignmentWorker(QObject):
                     if not self._sleep(p["settle_time"]): return None, None
                     y = self._read_float(signal_pv, f"{substep_key} — read scan signal")
                     scan_ys.append(y)
-                    self.scan_point.emit(scan_key, float(x), float(y))
+                    self.scan_point.emit(substep_key, float(x), float(y))
                     xs_all.append(float(x)); ys_all.append(float(y))
                     if self._abort: return None, None
             return scan_xs, scan_ys
@@ -1220,10 +1403,10 @@ class AlignmentWorker(QObject):
         fwhm = 2.0 * sig * (np.log(2) ** (1.0 / max(p_exp, 0.5)))
         best_x = float(np.asarray(xs_s)[np.argmax(ys_s)])
         final = pk if abs(pk - best_x) < fwhm else best_x
-        self.scan_peak.emit(scan_key, final)
+        self.scan_peak.emit(substep_key, final)
         return final, sig
 
-    def _smart_scan_zero(self, scan_key, motor_pv, center, half_range, steps,
+    def _smart_scan_zero(self, motor_pv, center, half_range, steps,
                          sim_fn, substep_key):
         """Adaptive scan for BPM zero-crossing. Returns zero_pos or None."""
         p = self.params
@@ -1251,7 +1434,7 @@ class AlignmentWorker(QObject):
             if self.simulate:
                 scan_xs, scan_ys = sim_fn(a, b, n)
                 for x, y in zip(scan_xs, scan_ys):
-                    self.scan_point.emit(scan_key, float(x), float(y))
+                    self.scan_point.emit(substep_key, float(x), float(y))
                     xs_all.append(float(x)); ys_all.append(float(y))
             else:
                 scan_xs = list(np.linspace(a, b, n))
@@ -1263,7 +1446,7 @@ class AlignmentWorker(QObject):
                     if not self._sleep(p["settle_time"]): return None, None
                     y = self._read_float(bpm_x, f"{substep_key} — read BPM X")
                     scan_ys.append(y)
-                    self.scan_point.emit(scan_key, float(x), float(y))
+                    self.scan_point.emit(substep_key, float(x), float(y))
                     xs_all.append(float(x)); ys_all.append(float(y))
                     if self._abort: return None, None
             return scan_xs, scan_ys
@@ -1286,7 +1469,7 @@ class AlignmentWorker(QObject):
 
         xs_s, ys_s = sorted_all()
         zero = find_zero_crossing(xs_s, ys_s)
-        self.scan_peak.emit(scan_key, zero)
+        self.scan_peak.emit(substep_key, zero)
         return zero
 
     # ── Which PVs this run needs ───────────────────────────────────
@@ -1316,82 +1499,80 @@ class AlignmentWorker(QObject):
         return ""
 
     def _required_pvs(self):
-        """PVs this run will actually touch, as [(label, pv_name, try_rbv)].
+        """PVs this run will touch, as [(label, pv_name, try_rbv, writable)].
 
         Computed dynamically — skip_mirror, blank names and the configured
-        signal sources all change the set.
+        signal sources all change the set. `writable` marks the ones the
+        sequence drives, which are the ones worth classifying as motors.
         """
         pvs, p = self.pvs, self.params
-        out  = []
-        dmov = []
+        out = []
 
-        def add(label, name, try_rbv=False):
-            out.append((label, (name or "").strip(), try_rbv))
+        def add(label, name, try_rbv=False, writable=False):
+            out.append((label, (name or "").strip(), try_rbv, writable))
 
         # ── always used ──
-        add("H feedback",       pvs.get("feedback_h"))
-        add("V feedback",       pvs.get("feedback_v"))
-        add("Undulator energy", pvs.get("und_energy"))
+        add("H feedback",       pvs.get("feedback_h"), writable=True)
+        add("V feedback",       pvs.get("feedback_v"), writable=True)
+        add("Undulator energy", pvs.get("und_energy"), writable=True)
         if (pvs.get("und_harmonic") or "").strip():
-            add("Undulator harmonic", pvs["und_harmonic"])
+            add("Undulator harmonic", pvs["und_harmonic"], writable=True)
         if (pvs.get("und_start") or "").strip():
-            add("Undulator start", pvs["und_start"])
-        add("Mono energy",     pvs.get("mono_energy"), try_rbv=True)
-        add("DCM roll",        pvs.get("roll"),  try_rbv=True)
-        add("DCM pitch",       pvs.get("pitch"), try_rbv=True)
-        add("DCM piezo pitch", pvs.get("piezo_pitch"))
-        add("DCM piezo roll",  pvs.get("piezo_roll"))
+            add("Undulator start", pvs["und_start"], writable=True)
+        if (pvs.get("und_busy") or "").strip():
+            add("Undulator busy flag", pvs["und_busy"])
+        if (pvs.get("und_energy_rbv") or "").strip():
+            add("Undulator energy RBV", pvs["und_energy_rbv"])
+        add("Mono energy",     pvs.get("mono_energy"), try_rbv=True, writable=True)
+        add("DCM roll",        pvs.get("roll"),  try_rbv=True, writable=True)
+        add("DCM pitch",       pvs.get("pitch"), try_rbv=True, writable=True)
+        add("DCM piezo pitch", pvs.get("piezo_pitch"), writable=True)
+        add("DCM piezo roll",  pvs.get("piezo_roll"), writable=True)
         add("DCM scan signal", self._signal_pv("dcm_signal"))
         add("BPM X",           pvs.get("bpm_x"))
         add("BPM Y",           pvs.get("bpm_y"))
         add("BPM intensity",   pvs.get("bpm_intensity"))
         # 5C drives the mirror pitch piezo whether or not Step 4 ran.
         if (pvs.get("mir_piezo_pitch") or "").strip():
-            add("Mirror piezo pitch", pvs["mir_piezo_pitch"])
-
-        dmov += [("DCM roll", pvs.get("roll")), ("DCM pitch", pvs.get("pitch"))]
+            add("Mirror piezo pitch", pvs["mir_piezo_pitch"], writable=True)
 
         # Mirror stages are driven at 2C unconditionally, and again at 4B or 5.
         for stage in self.mirror_stages:
             nm = (stage.get("pv") or "").strip()
             if nm:
-                add("Stage: %s" % stage.get("name", nm), nm)
+                add("Stage: %s" % stage.get("name", nm), nm, writable=True)
 
         # _apply_mirror_stripe runs in both branches. These are module constants
         # rather than entries in `pvs`, which makes them easy to overlook.
-        add("Mirror stripe VFM:X", _STRIPE_VFM_X_PV, try_rbv=True)
-        add("Mirror stripe VDM:X", _STRIPE_VDM_X_PV, try_rbv=True)
-        dmov += [("Mirror stripe VFM:X", _STRIPE_VFM_X_PV),
-                 ("Mirror stripe VDM:X", _STRIPE_VDM_X_PV)]
+        add("Mirror stripe VFM:X", _STRIPE_VFM_X_PV, try_rbv=True, writable=True)
+        add("Mirror stripe VDM:X", _STRIPE_VDM_X_PV, try_rbv=True, writable=True)
 
         # ── only when Step 4 runs ──
         if not self.skip_mirror:
             top = (pvs.get("mir_slit_top") or "").strip()
             bot = (pvs.get("mir_slit_bot") or "").strip()
             if top and bot:      # mirrors the `if top_pv and bot_pv` guard in 4A
-                add("Mirror slit top",    top, try_rbv=True)
-                add("Mirror slit bottom", bot, try_rbv=True)
-                dmov += [("Mirror slit top", top), ("Mirror slit bottom", bot)]
+                add("Mirror slit top",    top, try_rbv=True, writable=True)
+                add("Mirror slit bottom", bot, try_rbv=True, writable=True)
             vdm_pv, vfm_pv = self._mirror_yz_pvs()
-            add("VDM:Y", vdm_pv, try_rbv=True)
-            add("VFM:Y", vfm_pv, try_rbv=True)
-            dmov += [("VDM:Y", vdm_pv), ("VFM:Y", vfm_pv)]
+            add("VDM:Y", vdm_pv, try_rbv=True, writable=True)
+            add("VFM:Y", vfm_pv, try_rbv=True, writable=True)
             if p.get("mir_signal", "BPM Intensity") != "BPM Intensity":
                 add("Mirror scan signal", self._signal_pv("mir_signal"))
 
-        for label, name in dmov:
-            name = (name or "").strip()
-            if name:
-                out.append(("%s .DMOV" % label, name + ".DMOV", False))
-
         seen, uniq = set(), []
-        for label, name, try_rbv in out:
+        for label, name, try_rbv, writable in out:
             if name and name in seen:
                 continue
             if name:
                 seen.add(name)
-            uniq.append((label, name, try_rbv))
+            uniq.append((label, name, try_rbv, writable))
         return uniq
+
+    def _writable_pvs(self):
+        """The subset of _required_pvs() that the sequence actually drives."""
+        return [(label, name) for label, name, _rbv, writable in self._required_pvs()
+                if writable and name]
 
     def active_pv_set(self):
         """PV names this run touches, base names included.
@@ -1400,7 +1581,7 @@ class AlignmentWorker(QObject):
         dead sensitivity readback, must not pause a run that never reads it.
         """
         names = set()
-        for _label, name, _rbv in self._required_pvs():
+        for _label, name, _rbv, _w in self._required_pvs():
             if name:
                 names.add(name)
                 names.add(name.split(".")[0])
@@ -1421,7 +1602,7 @@ class AlignmentWorker(QObject):
             return
         while True:
             rows, bad = [], []
-            for label, name, try_rbv in self._required_pvs():
+            for label, name, try_rbv, _w in self._required_pvs():
                 self._pause_point()
                 if self._abort:
                     raise PVFaultAbort("(pre-flight)", "aborted during pre-flight")
@@ -1430,20 +1611,25 @@ class AlignmentWorker(QObject):
                     bad.append(("", "%s has no PV name configured" % label))
                     continue
                 ok, detail = probe_pv(name, timeout=1.0, try_rbv=try_rbv)
-                if not ok and name.endswith(".DMOV"):
-                    # Warn rather than block: motion completion cannot be verified
-                    # for this motor, but the sequence can still run.
-                    rows.append((label, name, "no .DMOV"))
-                    continue
                 rows.append((label, name, detail))
                 if not ok:
                     bad.append((name, "did not connect (%s)" % detail))
-            self.preflight_report.emit(rows)
             n_ok = sum(1 for _l, _p, st in rows if st.startswith("ok"))
-            no_dmov = [l for l, _p, st in rows if st == "no .DMOV"]
-            for label in no_dmov:
-                self.log("  WARNING: %s has no .DMOV — motion completion cannot "
-                         "be verified for it." % label, "warn")
+
+            # Classify what we drive. A PV whose .DMOV connects is a motor
+            # record and is awaited via its own flags; anything else is a plain
+            # record whose put-callback is the write confirmation.
+            self._is_motor = {}
+            n_motors = 0
+            for label, name in self._writable_pvs():
+                is_motor, _d = probe_pv(name + ".DMOV", timeout=1.0)
+                self._is_motor[name] = is_motor
+                n_motors += 1 if is_motor else 0
+                rows.append((label + "  → type", name,
+                             "motor record" if is_motor else "plain record"))
+            self.preflight_report.emit(rows)
+            self.log("  %d of %d driven PVs are motor records."
+                     % (n_motors, len(self._is_motor)))
             if not bad:
                 self.log("  %d / %d PVs connected. Pre-flight passed."
                          % (n_ok, len(rows)), "ok")
@@ -1534,6 +1720,9 @@ class AlignmentWorker(QObject):
             self._write(pvs["und_start"], 1, "2B — start undulator move")
             self.log(f"  [{pvs['und_start']}] → 1  (start undulator move)", "ok")
             if not self._sleep(0.15): return self._abort_cleanup()
+        # The sequence used to go straight into the Step 3 pitch scan while the
+        # undulator was still travelling.
+        if not self._wait_undulator(): return self._abort_cleanup()
         for key, pv_key, unit in [
             ("mono_e", "mono_energy", "keV"),
             ("roll",   "roll",        ""),
@@ -1553,7 +1742,12 @@ class AlignmentWorker(QObject):
                             f"2C — move {stage['name']} OUT")
                 self.log(f"  [{stage['pv']}] → {stage['val_out']}  ({stage['name']} OUT)", "ok")
                 if not self._sleep(0.1): return self._abort_cleanup()
-        if not self._sleep(0.4): return self._abort_cleanup()
+        # Every setpoint is issued above so the stages travel concurrently; only
+        # now wait for them. CRL Y alone takes ~60 s, so the old 0.4 s sleep
+        # announced "Mirror retracted." while it was still moving.
+        if not self._wait_all_motors([st["pv"] for st in self.mirror_stages],
+                                     "mirror stages"):
+            return self._abort_cleanup()
         self.log("  Mirror retracted.", "ok")
         self.substep_status.emit("2_2c", "done")
         self.step_status.emit(2, "done")
@@ -1580,7 +1774,7 @@ class AlignmentWorker(QObject):
         def _sim_pitch_coarse(a, b, n):
             return sim_scan_pitch(a, b, n, _true_peak_coarse)
         pitch_coarse, _sig3b = self._smart_scan_peak(
-            "pitch", pvs['pitch'],
+            pvs['pitch'],
             center=row["pitch"],
             half_range=(p["pitch_stop"] - p["pitch_start"]) / 2.0,
             steps=p["pitch_steps"],
@@ -1604,7 +1798,7 @@ class AlignmentWorker(QObject):
         def _sim_roll(a, b, n):
             return sim_scan_roll_bpm(a, b, n, _true_zero)
         roll_zero = self._smart_scan_zero(
-            "roll", pvs['roll'],
+            pvs['roll'],
             center=row["roll"],
             half_range=(p["roll_stop"] - p["roll_start"]) / 2.0,
             steps=p["roll_steps"],
@@ -1628,7 +1822,7 @@ class AlignmentWorker(QObject):
         def _sim_pitch_fine(a, b, n):
             return sim_scan_pitch(a, b, n, _true_peak)
         pitch_peak, _sig3d = self._smart_scan_peak(
-            "pitch", pvs['pitch'],
+            pvs['pitch'],
             center=pitch_coarse,
             half_range=(p["pitch_stop"] - p["pitch_start"]) / 2.0,
             steps=p["pitch_steps"],
@@ -1730,11 +1924,11 @@ class AlignmentWorker(QObject):
                            if self.simulate
                            else self._read_float(signal_pv, "4A — read slit scan signal"))
                     ys_slit.append(sig)
-                    self.scan_point.emit("mir_slit_cen", float(cen), float(sig))
+                    self.scan_point.emit("4_4A", float(cen), float(sig))
                     if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
                 slit_peak = find_peak_centroid(xs_slit, np.array(ys_slit))
-                self.scan_peak.emit("mir_slit_cen", slit_peak)
+                self.scan_peak.emit("4_4A", slit_peak)
                 self.log(f"  Beam center at {slit_peak:.4f} mm → moving slit", "ok")
                 self._write(top_pv, slit_peak + slit_size_a / 2.0, "4A — centre slit top")
                 self._write(bot_pv, slit_peak - slit_size_a / 2.0, "4A — centre slit bottom")
@@ -1755,7 +1949,9 @@ class AlignmentWorker(QObject):
                                 f"4B — move {stage['name']} IN")
                     self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
                     if not self._sleep(0.1): return self._abort_cleanup()
-            if not self._sleep(0.5): return self._abort_cleanup()
+            if not self._wait_all_motors([st["pv"] for st in self.mirror_stages],
+                                         "mirror stages"):
+                return self._abort_cleanup()
             self.log("  Mirror in position.", "ok")
             if not self._apply_mirror_stripe(float(self.row.get("mono_e", 0))):
                 return self._abort_cleanup()
@@ -1788,11 +1984,11 @@ class AlignmentWorker(QObject):
                             if self.simulate
                             else self._read_float(pvs["bpm_y"], "4C — read BPM Y"))
                     ys_bpmy.append(bpmy)
-                    self.scan_point.emit("mir_piezo", float(px), float(bpmy))
+                    self.scan_point.emit("4_4C", float(px), float(bpmy))
                     self.bpm_update.emit(0.0, float(bpmy), 0.5)
 
                 piezo_zero = find_zero_crossing(xs_piezo, np.array(ys_bpmy))
-                self.scan_peak.emit("mir_piezo", piezo_zero)
+                self.scan_peak.emit("4_4C", piezo_zero)
                 self._write(mir_piezo_pv, piezo_zero,
                             "4C — move mirror piezo to the BPM Y zero-crossing")
                 self.log(f"  BPMY zero-crossing at piezo = {piezo_zero:.5f} → moved", "ok")
@@ -1817,11 +2013,11 @@ class AlignmentWorker(QObject):
                        if self.simulate
                        else self._read_float(signal_pv, "4D — read VDM scan signal"))
                 ys_vdm.append(sig)
-                self.scan_point.emit("mir_vdm", float(vdm_pos), float(sig))
+                self.scan_point.emit("4_4D", float(vdm_pos), float(sig))
                 if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
             vdm_peak = find_peak_centroid(xs_vdm, np.array(ys_vdm))
-            self.scan_peak.emit("mir_vdm", vdm_peak)
+            self.scan_peak.emit("4_4D", vdm_peak)
             _fwhm4d = fwhm_half_max(xs_vdm, np.array(ys_vdm))
             if _fwhm4d is not None:
                 self._scan_results["VDM Y FWHM @ 4D (µm)"] = f"{_fwhm4d:.2f}"
@@ -1852,13 +2048,13 @@ class AlignmentWorker(QObject):
                        if self.simulate
                        else self._read_float(signal_pv, "4E — read coupled scan signal"))
                 ys_coupled.append(sig)
-                self.scan_point.emit("mir_coupled", float(vfm_pos), float(sig))
+                self.scan_point.emit("4_4E", float(vfm_pos), float(sig))
                 if not self._sleep(p["settle_time"]): return self._abort_cleanup()
 
             vfm_peak_pos    = find_peak_centroid(xs_vfm, np.array(ys_coupled))
             vfm_delta_final = vfm_peak_pos - vfm_cur
             vdm_final       = vdm_ref + 2.0 * vfm_delta_final
-            self.scan_peak.emit("mir_coupled", vfm_peak_pos)
+            self.scan_peak.emit("4_4E", vfm_peak_pos)
             _fwhm4e = fwhm_half_max(xs_vfm, np.array(ys_coupled))
             if _fwhm4e is not None:
                 self._scan_results["VFM Y FWHM @ 4E (µm)"] = f"{_fwhm4e:.2f}"
@@ -1895,7 +2091,9 @@ class AlignmentWorker(QObject):
                                 f"5 — move {stage['name']} IN")
                     self.log(f"  [{stage['pv']}] → {stage['val_in']}  ({stage['name']} IN)", "ok")
                     if not self._sleep(0.1): return self._abort_cleanup()
-            if not self._sleep(0.4): return self._abort_cleanup()
+            if not self._wait_all_motors([st["pv"] for st in self.mirror_stages],
+                                         "mirror stages"):
+                return self._abort_cleanup()
             self.log("  Mirror in position.", "ok")
             if not self._apply_mirror_stripe(float(self.row.get("mono_e", 0))):
                 return self._abort_cleanup()
@@ -1946,11 +2144,11 @@ class AlignmentWorker(QObject):
                        else self._read_float(self._signal_pv("dcm_signal"),
                                              "5B — read scan signal"))
                 ys_dcm.append(sig)
-                self.scan_point.emit("pitch", float(px), float(sig))
+                self.scan_point.emit("5_5b", float(px), float(sig))
                 self.bpm_update.emit(random.uniform(-0.0001, 0.0001),
                                      random.uniform(-0.001, 0.001), float(sig) / 1000.0)
             dcm_piezo_peak = find_peak_centroid(xs_dcm, np.array(ys_dcm))
-            self.scan_peak.emit("pitch", dcm_piezo_peak)
+            self.scan_peak.emit("5_5b", dcm_piezo_peak)
             self._write(dcm_piezo_pv, dcm_piezo_peak, "5B — move DCM piezo to the peak")
             self.log(f"  Intensity peak at DCM piezo = {dcm_piezo_peak:.5f} → moved", "ok")
         else:
@@ -1979,10 +2177,10 @@ class AlignmentWorker(QObject):
                         if self.simulate
                         else self._read_float(pvs.get("bpm_y", ""), "5C — read BPM Y"))
                 ys_mp.append(bpmy)
-                self.scan_point.emit("mir_piezo", float(px), float(bpmy))
+                self.scan_point.emit("5_5c", float(px), float(bpmy))
                 self.bpm_update.emit(random.uniform(-0.0001, 0.0001), float(bpmy), 0.98)
             mp_zero = find_zero_crossing(xs_mp, np.array(ys_mp))
-            self.scan_peak.emit("mir_piezo", mp_zero)
+            self.scan_peak.emit("5_5c", mp_zero)
             self._write(mir_piezo_pv5, mp_zero,
                         "5C — move mirror piezo to the BPM Y zero-crossing")
             self.log(f"  BPM y zero-crossing at mirror piezo = {mp_zero:.5f} → moved", "ok")
@@ -2102,19 +2300,30 @@ def styled_button(text, obj_name="", min_width=0):
     return btn
 
 
-def make_plot(title="", y_label="Signal", x_label="Motor position"):
-    pg.setConfigOptions(antialias=True)
-    plot = pg.PlotWidget(background=PAL["bg"])
-    plot.setLabel("bottom", x_label, color=PAL["text_dim"])
-    plot.setLabel("left", y_label, color=PAL["text_dim"])
-    plot.getAxis("bottom").setPen(pg.mkPen(color=PAL["border"]))
-    plot.getAxis("left").setPen(pg.mkPen(color=PAL["border"]))
-    plot.getAxis("bottom").setTextPen(pg.mkPen(color=PAL["text_sec"]))
-    plot.getAxis("left").setTextPen(pg.mkPen(color=PAL["text_sec"]))
+def style_plot(plot, title=None, x_label=None, y_label=None):
+    """(Re-)apply the current PAL to a PlotWidget. Safe to call repeatedly.
+
+    The labels have to be re-set rather than merely recoloured: pyqtgraph bakes
+    the colour into the label HTML at setLabel() time, which is why the plots
+    used to stay light after switching to a dark theme.
+    """
+    plot.setBackground(PAL["bg"])
+    for axis in ("bottom", "left"):
+        plot.getAxis(axis).setPen(pg.mkPen(color=PAL["border"]))
+        plot.getAxis(axis).setTextPen(pg.mkPen(color=PAL["text_sec"]))
+    if x_label is not None:
+        plot.setLabel("bottom", x_label, color=PAL["text_dim"])
+    if y_label is not None:
+        plot.setLabel("left", y_label, color=PAL["text_dim"])
     plot.showGrid(x=True, y=True, alpha=0.15)
-    if title:
+    if title is not None:
         plot.setTitle(title, color=PAL["text_sec"], size="11pt")
     return plot
+
+
+def make_plot(title="", y_label="Signal", x_label="Motor position"):
+    pg.setConfigOptions(antialias=True)
+    return style_plot(pg.PlotWidget(), title or None, x_label, y_label)
 
 
 # ─── Beam path widget ─────────────────────────────────────────────────────────
@@ -2445,6 +2654,8 @@ class SetupTab(QWidget):
             "und_energy":      "Undulator Energy",
             "und_harmonic":    "Undulator Harmonic",
             "und_start":       "Undulator Start",
+            "und_busy":        "Undulator Busy flag",
+            "und_energy_rbv":  "Undulator Energy RBV",
             # DCM Piezos
             "piezo_pitch":     "DCM Piezo Pitch",
             "piezo_roll":      "DCM Piezo Roll",
@@ -2511,6 +2722,9 @@ class SetupTab(QWidget):
             ("roll_steps",   "Roll scan steps",   QSpinBox,        5, 200,   21,   0),
             ("settle_time",        "Settle time (s)",        QDoubleSpinBox, 0.0, 5.0, 0.1, 2),
             ("piezo_settle_time",  "Piezo settle time (s)",  QDoubleSpinBox, 0.0, 5.0, 0.2, 2),
+            ("pv_ack_timeout",      "PV write ack timeout (s)",   QDoubleSpinBox, 1.0, 120.0, 10.0, 1),
+            ("motor_start_grace",   "Motor start grace (s)",      QDoubleSpinBox, 0.5, 120.0,  5.0, 1),
+            ("motor_stall_timeout", "Motor stall timeout (s)",    QDoubleSpinBox, 1.0, 600.0, 30.0, 1),
             ("piezo_center", "Piezo center value",QDoubleSpinBox,  0.0, 10.0, 5.0,  1),
             ("smart_edge_fraction",    "Smart scan edge fraction",   QDoubleSpinBox, 0.05, 0.5,  0.2, 2),
             ("smart_max_extend_steps", "Smart scan max extend steps",QSpinBox,       1,    50,   10,  0),
@@ -3217,17 +3431,488 @@ class MirrorStripeWidget(QWidget):
                 b.setStyleSheet(self._on_style() if name == stripe else self._off_style())
 
 # ─── Motor → scan plot mapping ────────────────────────────────────────────────
-# Plot A: position/zero-crossing scans. Plot B: intensity peak scans.
-_SCAN_PLOT_A = {
-    "roll":         ("Roll Scan",              "BPM X (mm)",      "Roll position"),
-    "mir_slit_cen": ("Slit Scan  4A",          "Signal",          "Slit center (mm)"),
-    "mir_piezo":    ("Mirror Piezo Pitch  4C",   "BPM Y (mm)",      "Piezo position"),
+# ─── Scan figure registry ───────────────────────────────────
+# Everything about the plot area derives from these two tables: which tabs
+# exist, which device owns them, the axis text, the legend text, the trace
+# colours and the marker style. Adding a scan later is one row in each.
+#
+# (fig_id, device, tab text, plot title, x label, y label, fill under curve)
+_FIGURE_DEFS = [
+    ("dcm_pitch", "DCM",    "Pitch motor",  "DCM Pitch Motor",
+     "DCM pitch (µrad)",        "Intensity (a.u.)", True),
+    ("dcm_roll",  "DCM",    "Roll",         "DCM Roll Motor",
+     "DCM roll (µrad)",         "BPM X (mm)",       False),
+    ("dcm_piezo", "DCM",    "Pitch piezo",  "DCM Pitch Piezo",
+     "DCM pitch piezo (DCOM)",  "Intensity (a.u.)", True),
+    ("mir_slit",  "Mirror", "Slit",         "Slit Centre",
+     "Slit centre (mm)",        "Signal (a.u.)",    True),
+    ("mir_piezo", "Mirror", "Mirror piezo", "Mirror Pitch Piezo",
+     "Mirror piezo (DCOM)",     "BPM Y (mm)",       False),
+    ("mir_vdm",   "Mirror", "VDM:Y",        "VDM:Y Scan",
+     "VDM:Y (µm)",              "Signal (a.u.)",    True),
+    ("mir_vfm",   "Mirror", "VFM:Y",        "Coupled VFM:Y + VDM:Y",
+     "VFM:Y (µm)",              "Signal (a.u.)",    True),
+]
+_PLOT_DEVICES = ("DCM", "Mirror")
+
+# substep key (as emitted by scan_point/scan_peak/substep_status)
+#   -> (fig_id, legend label, marker kind)
+# Two figures carry two traces: the coarse/fine pitch pair and the mirror piezo
+# before and after the feedback work. The piezo scans deliberately sit on their
+# own figures because their x axis is a DCOM demand, not a motor position.
+_SCAN_ROUTES = {
+    "3_3b": ("dcm_pitch", "3B  pitch coarse",         "peak"),
+    "3_3d": ("dcm_pitch", "3D  pitch fine",           "peak"),
+    "3_3c": ("dcm_roll",  "3C  roll → BPM X = 0",     "zero"),
+    "5_5b": ("dcm_piezo", "5B  DCM piezo",            "peak"),
+    "4_4A": ("mir_slit",  "4A  slit centre",          "peak"),
+    "4_4C": ("mir_piezo", "4C  mirror piezo",         "zero"),
+    "5_5c": ("mir_piezo", "5C  mirror piezo (FB on)", "zero"),
+    "4_4D": ("mir_vdm",   "4D  VDM:Y",                "peak"),
+    "4_4E": ("mir_vfm",   "4E  VFM:Y + VDM:Y",        "peak"),
 }
-_SCAN_PLOT_B = {
-    "pitch":        ("Pitch Scan",             "Intensity (a.u.)", "Pitch position"),
-    "mir_vdm":      ("VDM Scan  4D",           "Signal",          "VDM:Y"),
-    "mir_coupled":  ("VFM+VDM Scan  4E",       "Signal",          "VFM:Y"),
-}
+
+
+class ScanSeries:
+    """One scan's points on one figure. Deliberately free of Qt so a future
+    Alignment History tab can rebuild it from a saved run."""
+
+    def __init__(self, key, label, color, marker_kind="peak"):
+        self.key         = key
+        self.label       = label
+        self.color       = color
+        self.marker_kind = marker_kind      # "peak" | "zero"
+        self.xs, self.ys = [], []           # sorted by x, for drawing
+        self.raw         = []               # (x, y) in acquisition order
+        self.marker      = None
+
+    def add_point(self, x, y):
+        # The adaptive scans emit their extension and fine passes out of x
+        # order; inserting in place keeps the drawn curve monotonic while `raw`
+        # preserves the true acquisition sequence.
+        i = bisect.bisect_left(self.xs, x)
+        self.xs.insert(i, x)
+        self.ys.insert(i, y)
+        self.raw.append((x, y))
+
+    def set_marker(self, value):
+        self.marker = value
+
+    def to_dict(self):
+        return {"key": self.key, "label": self.label, "color": self.color,
+                "marker_kind": self.marker_kind, "marker": self.marker,
+                "xs": list(self.xs), "ys": list(self.ys), "raw": list(self.raw)}
+
+    @classmethod
+    def from_dict(cls, d):
+        sr = cls(d["key"], d["label"], d["color"], d.get("marker_kind", "peak"))
+        sr.xs, sr.ys = list(d.get("xs", [])), list(d.get("ys", []))
+        sr.raw, sr.marker = list(d.get("raw", [])), d.get("marker")
+        return sr
+
+
+class FigureModel(QObject):
+    """One logical figure: axis metadata plus its series, in creation order."""
+
+    series_added   = pyqtSignal(str)
+    point_added    = pyqtSignal(str)
+    marker_changed = pyqtSignal(str)
+    cleared        = pyqtSignal()
+
+    def __init__(self, fig_id, device, tab_text, title,
+                 x_label, y_label, fill=False, parent=None):
+        super().__init__(parent)
+        self.fig_id   = fig_id
+        self.device   = device
+        self.tab_text = tab_text
+        self.title    = title
+        self.x_label  = x_label
+        self.y_label  = y_label
+        self.fill     = fill
+        self._series  = {}
+
+    def order(self):
+        return list(self._series.values())
+
+    def get(self, key):
+        return self._series.get(key)
+
+    def is_empty(self):
+        return not self._series
+
+    def series(self, key, label, marker_kind="peak"):
+        """Get or create a trace. Colour is assigned by insertion order, so a
+        figure's first trace is always blue and its second always orange."""
+        sr = self._series.get(key)
+        if sr is None:
+            color = SERIES_COLORS[len(self._series) % len(SERIES_COLORS)]
+            sr = ScanSeries(key, label, color, marker_kind)
+            self._series[key] = sr
+            self.series_added.emit(key)
+        return sr
+
+    def add_point(self, key, label, x, y, marker_kind="peak"):
+        self.series(key, label, marker_kind).add_point(x, y)
+        self.point_added.emit(key)
+
+    def set_marker(self, key, label, value, marker_kind="peak"):
+        self.series(key, label, marker_kind).set_marker(value)
+        self.marker_changed.emit(key)
+
+    def clear(self):
+        if self._series:
+            self._series = {}
+            self.cleared.emit()
+
+    def to_dict(self):
+        return {"fig_id": self.fig_id, "device": self.device, "title": self.title,
+                "x_label": self.x_label, "y_label": self.y_label,
+                "series": [sr.to_dict() for sr in self.order()]}
+
+
+class ScanFigureView(QWidget):
+    """One PlotWidget rendering one FigureModel.
+
+    Several views may share a model: a QTabWidget cannot hold the same widget
+    twice, so each pane owns its own view and they stay in step through the
+    model's signals. That also lets the two panes keep independent zoom.
+    """
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self._model  = model
+        self._items  = {}          # series key -> (curve, scatter, marker line)
+        self._dirty  = set()
+        self._zero   = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._plot = make_plot(model.title, model.y_label, model.x_label)
+        self._plot.setMinimumHeight(170)
+        self._legend = self._plot.addLegend(offset=(-10, 10))
+        lay.addWidget(self._plot)
+        model.series_added.connect(self._redraw)
+        model.point_added.connect(self._redraw)
+        model.marker_changed.connect(self._apply_marker)
+        model.cleared.connect(self.rebuild_from_model)
+        self.refresh_theme()
+        self.rebuild_from_model()
+
+    # ── items ────────────────────────────────────────────────
+
+    def _ensure_items(self, sr):
+        if sr.key in self._items:
+            return self._items[sr.key]
+        pen = pg.mkPen(sr.color, width=2)
+        if self._model.fill:
+            curve = self._plot.plot([], [], pen=pen, name=sr.label,
+                                    fillLevel=0, brush=pg.mkBrush(sr.color + "30"))
+        else:
+            curve = self._plot.plot([], [], pen=pen, name=sr.label)
+        scatter = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(sr.color), pen=None)
+        self._plot.addItem(scatter)
+        marker = pg.InfiniteLine(angle=90, pen=pg.mkPen(sr.color, width=1.5,
+                                                        style=Qt.PenStyle.DashLine))
+        marker.setVisible(False)
+        self._plot.addItem(marker)
+        if sr.marker_kind == "zero" and self._zero is None:
+            self._zero = pg.InfiniteLine(
+                angle=0, pos=0.0,
+                pen=pg.mkPen(PAL["border"], style=Qt.PenStyle.DashLine))
+            self._plot.addItem(self._zero)
+        self._items[sr.key] = (curve, scatter, marker)
+        return self._items[sr.key]
+
+    def _draw(self, sr):
+        curve, scatter, _m = self._ensure_items(sr)
+        curve.setData(sr.xs, sr.ys)
+        scatter.setData(sr.xs, sr.ys)
+
+    def _redraw(self, key):
+        sr = self._model.get(key)
+        if sr is None:
+            return
+        if not self.isVisible():
+            self._dirty.add(key)      # a hidden pane costs nothing during a scan
+            return
+        self._draw(sr)
+
+    def _apply_marker(self, key):
+        sr = self._model.get(key)
+        if sr is None or sr.marker is None:
+            return
+        if not self.isVisible():
+            self._dirty.add(key)
+            return
+        _c, _s, marker = self._ensure_items(sr)
+        marker.setValue(sr.marker)
+        marker.setVisible(True)
+
+    def rebuild_from_model(self):
+        self._plot.clear()
+        self._items = {}
+        self._zero  = None
+        if self._legend is not None:
+            self._legend.clear()
+        for sr in self._model.order():
+            self._draw(sr)
+            if sr.marker is not None:
+                _c, _s, marker = self._items[sr.key]
+                marker.setValue(sr.marker)
+                marker.setVisible(True)
+        self._dirty.clear()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._dirty:
+            self._dirty.clear()
+            self.rebuild_from_model()
+
+    def refresh_theme(self):
+        style_plot(self._plot, self._model.title, self._model.x_label,
+                   self._model.y_label)
+        lg = self._legend
+        if lg is not None:
+            for setter, value in (("setLabelTextColor", PAL["text_sec"]),
+                                  ("setBrush", pg.mkBrush(PAL["surface"] + "cc")),
+                                  ("setPen", pg.mkPen(PAL["border"]))):
+                try:
+                    getattr(lg, setter)(value)
+                except Exception:
+                    pass      # older pyqtgraph: degrade rather than raise
+        if self._zero is not None:
+            self._zero.setPen(pg.mkPen(PAL["border"], style=Qt.PenStyle.DashLine))
+
+
+class FigurePane(QTabWidget):
+    """One pane: a tab per figure of one device. Pages build their view lazily."""
+
+    figure_selected = pyqtSignal(str)
+
+    def __init__(self, device, models, parent=None):
+        super().__init__(parent)
+        self.setDocumentMode(True)
+        self._models = [m for m in models if m.device == device]
+        self._order  = [m.fig_id for m in self._models]
+        self._views  = {}
+        for model in self._models:
+            page = QWidget()
+            page_lay = QVBoxLayout(page)
+            page_lay.setContentsMargins(0, 0, 0, 0)
+            self.addTab(page, model.tab_text)
+        self.tabBar().setExpanding(False)
+        self.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        self.setUsesScrollButtons(True)
+        self.currentChanged.connect(self._on_current_changed)
+        self.refresh_theme()
+        self._build_page(0)
+
+    def _build_page(self, index):
+        if not (0 <= index < len(self._order)):
+            return
+        fig_id = self._order[index]
+        if fig_id in self._views:
+            return
+        view = ScanFigureView(self._models[index])
+        self.widget(index).layout().addWidget(view)
+        self._views[fig_id] = view
+
+    def _on_current_changed(self, index):
+        self._build_page(index)
+        if 0 <= index < len(self._order):
+            fig_id = self._order[index]
+            self.set_activity(fig_id, False)
+            self.figure_selected.emit(fig_id)
+
+    def show_figure(self, fig_id):
+        if fig_id in self._order:
+            self.setCurrentIndex(self._order.index(fig_id))
+
+    def current_fig(self):
+        i = self.currentIndex()
+        return self._order[i] if 0 <= i < len(self._order) else None
+
+    def set_activity(self, fig_id, on):
+        if fig_id not in self._order:
+            return
+        i = self._order.index(fig_id)
+        base = self._models[i].tab_text
+        self.setTabText(i, ("● " + base) if on else base)
+
+    def clear_activity(self):
+        for fig_id in self._order:
+            self.set_activity(fig_id, False)
+
+    def refresh_theme(self):
+        # The global QSS tab rule (8px/20px, 12pt) is far too heavy for two
+        # nested tab bars, so style this bar directly.
+        self.tabBar().setStyleSheet(
+            f"QTabBar::tab {{ background: {PAL['surface']}; color: {PAL['text_sec']};"
+            f" padding: 3px 10px; font-size: 11px; font-weight: 600;"
+            f" border: none; border-bottom: 2px solid transparent; }}"
+            f"QTabBar::tab:selected {{ color: {PAL['cyan']};"
+            f" border-bottom: 2px solid {PAL['cyan']}; }}")
+        for view in self._views.values():
+            view.refresh_theme()
+
+
+class DeviceSplitView(QWidget):
+    """Two independently-tabbed panes over one device's figures."""
+
+    def __init__(self, device, models, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        self.left  = FigurePane(device, models)
+        self.right = FigurePane(device, models)
+        split.addWidget(self.left)
+        split.addWidget(self.right)
+        split.setSizes([1, 1])
+        lay.addWidget(split)
+        if self.right.count() > 1:
+            self.right.setCurrentIndex(1)
+
+    def reset_selection(self):
+        self.left.setCurrentIndex(0)
+        if self.right.count() > 1:
+            self.right.setCurrentIndex(1)
+        self.left.clear_activity()
+        self.right.clear_activity()
+
+    def refresh_theme(self):
+        self.left.refresh_theme()
+        self.right.refresh_theme()
+
+
+class ScanPlotBoard(QWidget):
+    """The whole figure area, and the only plot object AlignmentTab touches."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._models = {}
+        order = []
+        for fig_id, device, tab_text, title, x_label, y_label, fill in _FIGURE_DEFS:
+            model = FigureModel(fig_id, device, tab_text, title,
+                                x_label, y_label, fill, self)
+            self._models[fig_id] = model
+            order.append(model)
+        self._suppress = False
+        self._follow   = True
+        self._running  = False
+        self._meta     = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._device_tabs = QTabWidget()
+        self._device_tabs.setDocumentMode(True)
+        self._devices = {}
+        for device in _PLOT_DEVICES:
+            view = DeviceSplitView(device, order)
+            self._devices[device] = view
+            self._device_tabs.addTab(view, device)
+            view.left.figure_selected.connect(self._on_manual_change)
+            view.right.figure_selected.connect(self._on_manual_change)
+        self._follow_chk = QCheckBox("Follow scan")
+        self._follow_chk.setChecked(True)
+        self._follow_chk.setToolTip(
+            "Bring the running scan's figure forward in the left pane.\n"
+            "Clears itself if you pick a tab yourself during a run.")
+        self._follow_chk.toggled.connect(self._on_follow_toggled)
+        self._device_tabs.setCornerWidget(self._follow_chk,
+                                          Qt.Corner.TopRightCorner)
+        self._device_tabs.currentChanged.connect(self._on_manual_change)
+        lay.addWidget(self._device_tabs)
+        self.setMinimumHeight(280)
+        self.refresh_theme()
+
+    # ── focus policy ─────────────────────────────────────────
+
+    def _on_manual_change(self, *_a):
+        # Programmatic changes are wrapped in _suppress, so reaching here during
+        # a run means the operator moved a tab and does not want to be followed.
+        if not self._suppress and self._running:
+            self.set_follow(False)
+
+    def _on_follow_toggled(self, on):
+        self._follow = bool(on)
+
+    def set_follow(self, on):
+        self._follow = bool(on)
+        if self._follow_chk.isChecked() != self._follow:
+            self._follow_chk.blockSignals(True)
+            self._follow_chk.setChecked(self._follow)
+            self._follow_chk.blockSignals(False)
+
+    def on_substep(self, substep_key, status):
+        route = _SCAN_ROUTES.get(substep_key)
+        if not route or status != "running":
+            return
+        fig_id = route[0]
+        device = self._models[fig_id].device
+        panes  = self._devices[device]
+        if not self._running or not self._follow:
+            target = panes.right if panes.right.current_fig() == fig_id else panes.left
+            target.set_activity(fig_id, True)
+            return
+        self._suppress = True
+        try:
+            self._device_tabs.setCurrentWidget(panes)
+            # If the operator already has it up on the right, leave the left alone.
+            if panes.right.current_fig() != fig_id:
+                panes.left.show_figure(fig_id)
+        finally:
+            self._suppress = False
+
+    # ── data in ──────────────────────────────────────────────
+
+    def add_point(self, substep_key, x, y):
+        route = _SCAN_ROUTES.get(substep_key)
+        if route:
+            fig_id, label, kind = route
+            self._models[fig_id].add_point(substep_key, label, x, y, kind)
+
+    def set_marker(self, substep_key, value):
+        route = _SCAN_ROUTES.get(substep_key)
+        if route:
+            fig_id, label, kind = route
+            self._models[fig_id].set_marker(substep_key, label, value, kind)
+
+    # ── run lifecycle ────────────────────────────────────────
+
+    def begin_run(self, meta=None):
+        self._meta = dict(meta or {})
+        for model in self._models.values():
+            model.clear()
+        self._suppress = True
+        try:
+            for view in self._devices.values():
+                view.reset_selection()
+            self._device_tabs.setCurrentIndex(0)
+        finally:
+            self._suppress = False
+        self._running = True
+        self.set_follow(True)
+
+    def end_run(self):
+        self._running = False
+        for view in self._devices.values():
+            view.left.clear_activity()
+            view.right.clear_activity()
+
+    # ── misc ─────────────────────────────────────────────────
+
+    def model(self, fig_id):
+        return self._models.get(fig_id)
+
+    def snapshot(self):
+        """The whole run as plain data — the hook for a future history tab."""
+        return {"meta": dict(self._meta),
+                "figures": [self._models[f[0]].to_dict() for f in _FIGURE_DEFS]}
+
+    def refresh_theme(self):
+        for view in self._devices.values():
+            view.refresh_theme()
 
 # ─── Alignment Tab ────────────────────────────────────────────────────────────
 class AlignmentTab(QWidget):
@@ -3470,34 +4155,9 @@ class AlignmentTab(QWidget):
         self._stripe_widget = MirrorStripeWidget()
         right_lay.addWidget(self._stripe_widget)
 
-        # Scan plots (always visible, updated per scan type)
-        plot_w = QWidget()
-        plot_lay = QHBoxLayout(plot_w)
-        plot_lay.setContentsMargins(0, 0, 0, 0)
-        plot_lay.setSpacing(8)
-        self._plot_a = make_plot("Scan A", "Signal", "Motor position")
-        self._plot_b = make_plot("Scan B", "Intensity", "Motor position")
-        self._pa_curve   = self._plot_a.plot([], [], pen=pg.mkPen(PAL["cyan"], width=2))
-        self._pa_scatter = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(PAL["cyan"]))
-        self._plot_a.addItem(self._pa_scatter)
-        self._pa_peak = pg.InfiniteLine(angle=90, pen=pg.mkPen(PAL["amber"], width=1.5,
-                                                                style=Qt.PenStyle.DashLine))
-        self._plot_a.addItem(self._pa_peak)
-        self._pa_peak.setVisible(False)
-        self._pb_curve   = self._plot_b.plot([], [], pen=pg.mkPen(PAL["cyan"], width=2),
-                                              fillLevel=0,
-                                              brush=pg.mkBrush(PAL["cyan_dim"] + "88"))
-        self._pb_scatter = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(PAL["cyan"]))
-        self._plot_b.addItem(self._pb_scatter)
-        self._pb_peak = pg.InfiniteLine(angle=90, pen=pg.mkPen(PAL["amber"], width=1.5,
-                                                                style=Qt.PenStyle.DashLine))
-        self._plot_b.addItem(self._pb_peak)
-        self._pb_peak.setVisible(False)
-        self._pa_xs, self._pa_ys, self._pa_motor = [], [], None
-        self._pb_xs, self._pb_ys, self._pb_motor = [], [], None
-        plot_lay.addWidget(self._plot_a)
-        plot_lay.addWidget(self._plot_b)
-        right_lay.addWidget(plot_w, 1)
+        # Scan figures: device tabs, each with two independently tabbed panes
+        self._plot_board = ScanPlotBoard()
+        right_lay.addWidget(self._plot_board, 1)
 
         # Log
         log_box = QGroupBox("Alignment Log")
@@ -3624,27 +4284,6 @@ class AlignmentTab(QWidget):
             lbl.setText(f"    ○  {base}")
             lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
 
-    def _start_scan(self, plot_id, motor):
-        title, y_label, x_label = (_SCAN_PLOT_A if plot_id == "A" else _SCAN_PLOT_B)[motor]
-        if plot_id == "A":
-            self._pa_xs.clear(); self._pa_ys.clear()
-            self._pa_motor = motor
-            self._pa_curve.setData([], [])
-            self._pa_scatter.setData([], [])
-            self._pa_peak.setVisible(False)
-            self._plot_a.setLabel("left",   y_label, color=PAL["text_dim"])
-            self._plot_a.setLabel("bottom", x_label, color=PAL["text_dim"])
-            self._plot_a.setTitle(title, color=PAL["text_sec"], size="11pt")
-        else:
-            self._pb_xs.clear(); self._pb_ys.clear()
-            self._pb_motor = motor
-            self._pb_curve.setData([], [])
-            self._pb_scatter.setData([], [])
-            self._pb_peak.setVisible(False)
-            self._plot_b.setLabel("left",   y_label, color=PAL["text_dim"])
-            self._plot_b.setLabel("bottom", x_label, color=PAL["text_dim"])
-            self._plot_b.setTitle(title, color=PAL["text_sec"], size="11pt")
-
     # ── Public ────────────────────────────────────────────────────────────────
 
     def _refresh_abort_btn(self):
@@ -3710,6 +4349,12 @@ class AlignmentTab(QWidget):
         mirror_stages = mirror_stages or DEFAULT_MIRROR_STAGES
 
         self._reset_ui()
+        self._plot_board.begin_run({
+            "row": dict(self._selected_row),
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "skip_mirror": self.skip_mirror_chk.isChecked(),
+            "simulate": simulate,
+        })
         self._running = True
         self.start_btn.setEnabled(False)
         self.abort_btn.setEnabled(True)
@@ -3732,7 +4377,7 @@ class AlignmentTab(QWidget):
         self._worker.scan_peak.connect(self._on_scan_peak)
         self._worker.bpm_update.connect(self._on_bpm_update)
         self._worker.feedback_update.connect(self._on_feedback)
-        self._worker.substep_status.connect(self._set_substep)
+        self._worker.substep_status.connect(self._on_substep_status)
         self._worker.confirm_needed.connect(self._on_confirm_needed)
         self._worker.scan_results_ready.connect(self._on_scan_results)
         self._worker.stripe_status.connect(self._stripe_widget.set_stripe)
@@ -3761,27 +4406,19 @@ class AlignmentTab(QWidget):
         )
         self.progress.setValue(done)
 
-    def _on_scan_point(self, motor, x, y):
-        if motor in _SCAN_PLOT_A:
-            if self._pa_motor != motor:
-                self._start_scan("A", motor)
-            self._pa_xs.append(x); self._pa_ys.append(y)
-            self._pa_curve.setData(self._pa_xs, self._pa_ys)
-            self._pa_scatter.setData(self._pa_xs, self._pa_ys)
-        elif motor in _SCAN_PLOT_B:
-            if self._pb_motor != motor:
-                self._start_scan("B", motor)
-            self._pb_xs.append(x); self._pb_ys.append(y)
-            self._pb_curve.setData(self._pb_xs, self._pb_ys)
-            self._pb_scatter.setData(self._pb_xs, self._pb_ys)
+    def _on_scan_point(self, substep_key, x, y):
+        self._plot_board.add_point(substep_key, x, y)
 
-    def _on_scan_peak(self, motor, peak):
-        if motor in _SCAN_PLOT_A:
-            self._pa_peak.setValue(peak)
-            self._pa_peak.setVisible(True)
-        elif motor in _SCAN_PLOT_B:
-            self._pb_peak.setValue(peak)
-            self._pb_peak.setVisible(True)
+    def _on_scan_peak(self, substep_key, peak):
+        self._plot_board.set_marker(substep_key, peak)
+
+    def _on_substep_status(self, key, status):
+        """Fan out one worker signal so the ordering is deterministic."""
+        self._set_substep(key, status)
+        self._plot_board.on_substep(key, status)
+
+    def refresh_plot_theme(self):
+        self._plot_board.refresh_theme()
 
     def _on_bpm_update(self, x, y, intensity):
         self._bpm_x_lbl.setText(f"{x:+.4f}")
@@ -3813,6 +4450,9 @@ class AlignmentTab(QWidget):
     def _proceed_clicked(self):
         if self._faulted or self._fault_dlg is not None:
             return   # resolve the PV fault first
+        # A confirm pause is exactly when the operator browses figures by hand,
+        # which disarms Follow. They have just said "carry on", so re-arm it.
+        self._plot_board.set_follow(True)
         self.proceed_btn.setEnabled(False)
         self.proceed_btn.setVisible(False)
         if self._worker:
@@ -3852,6 +4492,7 @@ class AlignmentTab(QWidget):
 
     def _on_pv_fault(self, pv, context, reason):
         self._faulted = True
+        self._plot_board.set_follow(False)   # let the operator inspect freely
         self._fault_rows.append(
             (pv, context, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         self.proceed_btn.setEnabled(False)
@@ -3916,6 +4557,7 @@ class AlignmentTab(QWidget):
 
     def _on_finished(self, success):
         self._running = False
+        self._plot_board.end_run()
         self.start_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
         self.proceed_btn.setVisible(False)
@@ -3942,16 +4584,6 @@ class AlignmentTab(QWidget):
         self.progress.setValue(0)
         for key in self._substep_labels:
             self._set_substep(key, "idle")
-        self._pa_xs.clear(); self._pa_ys.clear(); self._pa_motor = None
-        self._pb_xs.clear(); self._pb_ys.clear(); self._pb_motor = None
-        self._pa_curve.setData([], [])
-        self._pa_scatter.setData([], [])
-        self._pb_curve.setData([], [])
-        self._pb_scatter.setData([], [])
-        self._pa_peak.setVisible(False)
-        self._pb_peak.setVisible(False)
-        self._plot_a.setTitle("Scan A", color=PAL["text_sec"], size="11pt")
-        self._plot_b.setTitle("Scan B", color=PAL["text_sec"], size="11pt")
         self.log.clear()
 
 
@@ -4624,6 +5256,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(build_qss(PAL))
         self.alignment_tab._refresh_start_btn()
         self.alignment_tab._refresh_abort_btn()
+        self.alignment_tab.refresh_plot_theme()
         # Refresh readback label styles on next PV update (they read PAL live)
         self._theme_lbl.setStyleSheet(f"color: {PAL['text_dim']}; font-size: 11px;")
 
