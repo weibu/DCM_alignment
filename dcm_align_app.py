@@ -390,7 +390,7 @@ MOTOR_PV_KEYS = {"mono_energy", "roll", "pitch", "mir_slit_top", "mir_slit_bot",
 PV_TABS = {
     "global": ["und_energy", "und_harmonic", "und_start", "und_busy", "und_energy_rbv",
                "bpm_x", "bpm_y", "bpm_intensity", "bpm_sen",
-               "feedback_h", "feedback_v", "auto_feedback",
+               "feedback_h", "feedback_v", "auto_feedback", "shutter_blocking",
                "ion_chamber", "ic_sen_unit", "ic_sen_num"],
     "dcm":    ["mono_energy", "roll", "pitch", "piezo_pitch", "piezo_roll"],
     "mirror": ["mir_slit_top", "mir_slit_bot", "mir_pitch_motor", "mir_piezo_pitch",
@@ -425,6 +425,10 @@ DEFAULT_PVS = {
     # so while .O ("AutoFeedback") is 1 it forces both loops on and every write
     # to feedback_h/feedback_v below is ignored. Cleared at each chapter start.
     "auto_feedback":    "15IDA:userTran6.O",
+    # PSS shutter status, read only. A bi record with ZNAM="OFF"/ONAM="ON":
+    # 0 means nothing is blocking the beam. Note it sits at MAJOR severity even
+    # in that good state, so severity is not a usable test here.
+    "shutter_blocking": "S15ID-PSS:SCS:BeamBlockingM",
     "und_harmonic":     "",
     "und_start":        "",
     "und_busy":         "S15ID:USID:BusyM",
@@ -1362,6 +1366,34 @@ class AlignmentWorker(QObject):
         if auto_pv:
             self._write(auto_pv, 0, f"{number} \u2014 clear the AutoFeedback override")
 
+    def _pre_scan(self, substep_key, allow_h=False):
+        """Everything that must hold before a scan starts."""
+        self._require_beam(substep_key)
+        self._require_feedback_off(substep_key, allow_h=allow_h)
+
+    def _require_beam(self, substep_key):
+        """Refuse to scan while the upstream shutter is blocking the beam.
+
+        Unlike the feedback loops, this is not something the app may fix: the
+        PSS owns the shutter. So it pauses and waits for the operator to open
+        it and press Try Again.
+        """
+        if self.simulate:
+            return
+        pv = (self.pvs.get("shutter_blocking") or "").strip()
+        if not pv:
+            return
+        context = f"{substep_key} \u2014 upstream shutter check"
+        while True:
+            blocking = self._read_float(pv, context)
+            if not blocking:
+                return
+            state = self.epics.get(pv, as_string=True) or blocking
+            if self._fault(pv, context,
+                           f"the upstream shutter is blocking the beam (reads "
+                           f"{state!r}). Open it, then press Try Again.") == "abort":
+                raise PVFaultAbort(pv, context)
+
     def _require_feedback_off(self, substep_key, allow_h=False):
         """Assert the feedback loops are off before a scan, correcting if not.
 
@@ -1601,6 +1633,10 @@ class AlignmentWorker(QObject):
         add("V feedback",       pvs.get("feedback_v"), writable=True)
         if (pvs.get("auto_feedback") or "").strip():
             add("Auto Feedback On", pvs["auto_feedback"], writable=True)
+        # Read-only, but every scan depends on it, so a missing or dead shutter
+        # PV should stop the run before anything moves.
+        if any(k in _SCAN_ROUTES for k in (self.enabled or _SCAN_ROUTES)):
+            add("Upstream shutter", pvs.get("shutter_blocking"))
         for key, label in (("bpm_sen", "BPM sensitivity"),
                            ("ic_sen_unit", "IC sensitivity unit"),
                            ("ic_sen_num", "IC sensitivity num")):
@@ -1890,7 +1926,7 @@ class AlignmentWorker(QObject):
         # 3b: Pitch scan → intensity peak (coarse, before roll)
         if not self._skip("3_3b"):
             self.substep_status.emit("3_3b", "running")
-            self._require_feedback_off("3_3b")
+            self._pre_scan("3_3b")
             self.log("  Scanning DCM pitch → finding intensity peak (coarse)…")
             _true_peak_coarse = row["pitch"] + random.uniform(-0.01, 0.01)
             def _sim_pitch_coarse(a, b, n):
@@ -1916,7 +1952,7 @@ class AlignmentWorker(QObject):
         # 3c: Roll scan → BPM x = 0
         if not self._skip("3_3c"):
             self.substep_status.emit("3_3c", "running")
-            self._require_feedback_off("3_3c")
+            self._pre_scan("3_3c")
             self.log("  Scanning DCM roll → finding BPM x = 0 zero-crossing…")
             roll_span  = p["roll_stop"] - p["roll_start"]
             roll_start = row["roll"] + p["roll_start"]
@@ -1947,7 +1983,7 @@ class AlignmentWorker(QObject):
         # 3d: Pitch scan → intensity peak (fine, after roll)
         if not self._skip("3_3d"):
             self.substep_status.emit("3_3d", "running")
-            self._require_feedback_off("3_3d")
+            self._pre_scan("3_3d")
             self.log("  Scanning DCM pitch → finding intensity peak (fine)…")
             _true_peak = pitch_coarse + random.uniform(-0.005, 0.005)
             def _sim_pitch_fine(a, b, n):
@@ -2039,7 +2075,7 @@ class AlignmentWorker(QObject):
 
             if not self._skip("4_4A"):
                 self.substep_status.emit("4_4A", "running")
-                self._require_feedback_off("4_4A")
+                self._pre_scan("4_4A")
                 self.log("  4A: Slit center scan — mirror out, finding beam center…")
                 if top_pv and bot_pv:
                     cur_top = self._read_float(top_pv, "4A — read slit top position")
@@ -2127,7 +2163,7 @@ class AlignmentWorker(QObject):
 
                 mir_pitch_pv = (pvs.get("mir_pitch_motor") or "").strip()
                 if mir_pitch_pv:
-                    self._require_feedback_off("4_4C")
+                    self._pre_scan("4_4C")
                     self.log("  Scanning mirror pitch motor → BPMY = 0…")
                     pitch_cur = self._read_float(mir_pitch_pv,
                                                  "4C — read mirror pitch motor position")
@@ -2161,7 +2197,7 @@ class AlignmentWorker(QObject):
             # ── 4D: Scan VDM:Y → find peak → move ────────────────────
             if not self._skip("4_4D"):
                 self.substep_status.emit("4_4D", "running")
-                self._require_feedback_off("4_4D")
+                self._pre_scan("4_4D")
                 self.log("  4D: Scanning VDM:Y → finding signal peak…")
                 vdm_cur = self._read_float(vdm_pv, "4D — read VDM:Y position")
                 xs_vdm = np.linspace(vdm_cur + vdm_start, vdm_cur + vdm_stop, vdm_steps)
@@ -2193,7 +2229,7 @@ class AlignmentWorker(QObject):
             # ── 4E: Coupled VFM+VDM scan (VDM step = 2× VFM step) ────
             if not self._skip("4_4E"):
                 self.substep_status.emit("4_4E", "running")
-                self._require_feedback_off("4_4E")
+                self._pre_scan("4_4E")
                 self.log("  4E: Coupled VFM:Y + VDM:Y scan (VDM step = 2× VFM step)…")
                 vfm_cur  = self._read_float(vfm_pv, "4E — read VFM:Y position")
                 vdm_ref  = self._read_float(vdm_pv, "4E — read VDM:Y reference position")
@@ -2295,7 +2331,7 @@ class AlignmentWorker(QObject):
 
         if not self._skip("5_5b"):
             self.substep_status.emit("5_5b", "running")
-            self._require_feedback_off("5_5b", allow_h=True)
+            self._pre_scan("5_5b", allow_h=True)
             self.log("  Scanning DCM piezo pitch → max intensity…")
             dcm_piezo_pv = pvs.get("piezo_pitch", "")
             dp_start = p.get("dcm_piezo_start", -1.0)
@@ -2330,7 +2366,7 @@ class AlignmentWorker(QObject):
 
         if not self._skip("5_5c"):
             self.substep_status.emit("5_5c", "running")
-            self._require_feedback_off("5_5c", allow_h=True)
+            self._pre_scan("5_5c", allow_h=True)
             self.log("  Scanning mirror piezo pitch → BPM y = 0…")
             mir_piezo_pv5 = pvs.get("mir_piezo_pitch", "")
             mp_start = p.get("mir_piezo_start", -1.0)
@@ -2928,6 +2964,7 @@ class SetupTab(QWidget):
             "feedback_h":      "H Feedback PV",
             "feedback_v":      "V Feedback PV",
             "auto_feedback":   "Auto Feedback On",
+            "shutter_blocking": "Upstream Shutter (blocking)",
             # Mirror
             "mir_piezo_pitch": "Mirror Piezo Pitch",
             "mir_pitch_motor": "Mirror Pitch Motor",

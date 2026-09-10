@@ -67,6 +67,18 @@ produced a value — 4A's slit centre, 3B's coarse pitch — the sequence reads 
 live position instead. The mirror is inserted before Step 5 whenever it is
 actually out, tracked from what ran rather than inferred from a checkbox.
 
+### Beam availability
+
+Every scan first checks the upstream shutter, `S15ID-PSS:SCS:BeamBlockingM`.
+It is a bi record with `ZNAM="OFF"` / `ONAM="ON"`, and 0 means nothing is
+blocking the beam. If it reads blocking, the run pauses with the usual fault
+dialog and waits — the PSS owns the shutter, so unlike the feedback loops this
+is not something the app may put right on your behalf. Open it and press
+**Try Again**.
+
+Note the record sits at MAJOR severity even when the beam *is* available, so
+alarm severity is deliberately not used as the test.
+
 ### Feedback during the sequence
 
 Both loops are off from 2A onward. Before every scan the app **reads** the

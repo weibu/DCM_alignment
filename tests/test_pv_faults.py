@@ -33,7 +33,8 @@ app.describe_pv = lambda pv, timeout=2.0: (
 # A settled motor record: done, on target, no problem bits.
 _SETTLED = ((".DMOV", 1.0), (".MOVN", 0.0), (".MSTA", 2.0), (".LVIO", 0.0),
             (".MISS", 0.0), (".DIFF", 0.0), (".RDBD", 0.01), (".MRES", 0.001))
-_IDLE_PVS = {app.DEFAULT_PVS["und_busy"]: 0.0}      # undulator not moving
+_IDLE_PVS = {app.DEFAULT_PVS["und_busy"]: 0.0,          # undulator not moving
+             app.DEFAULT_PVS["shutter_blocking"]: 0.0}  # nothing blocking the beam
 
 
 _BPM_PVS = {app.DEFAULT_PVS["bpm_x"], app.DEFAULT_PVS["bpm_y"]}
@@ -267,30 +268,35 @@ still = [lbl for lbl, name, _rbv, _w in w5._required_pvs()
 R.check(not still,
         "pre-flight does not demand a PV no enabled step uses: %s" % still)
 
-R.finish()
+# -- a closed upstream shutter stops a scan and waits for the operator -------
+# The PSS owns the shutter, so unlike the feedback loops this must not be
+# "corrected" by the app; it pauses until someone opens it and hits Try Again.
+SHUTTER = app.DEFAULT_PVS["shutter_blocking"]
+w6 = app.AlignmentWorker(dict(app.DEFAULT_PVS), dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False)
+shut = {"blocking": 1.0}
+w6.epics.get = (lambda pv, as_string=False, timeout=3.0:
+                ("ON" if as_string else shut["blocking"]) if pv == SHUTTER else 0.0)
+seen6 = []
+w6.pv_fault.connect(lambda pv, c, r: (seen6.append((pv, r)), w6.fault_abort()))
+try:
+    w6._require_beam("3_3b")
+    raised6 = False
+except app.PVFaultAbort:
+    raised6 = True
+R.check(raised6, "a blocking upstream shutter stops the scan")
+R.check(seen6 and seen6[0][0] == SHUTTER,
+        "the shutter fault names the shutter PV: %s" % (seen6[0][0] if seen6 else None))
+R.check(seen6 and "blocking the beam" in seen6[0][1] and "'ON'" in seen6[0][1],
+        "the reason reports the shutter state: %r" % (seen6[0][1] if seen6 else None))
 
-# -- a PV an enabled step needs, but which is blank, must reach pre-flight ---
-# It used to be omitted from _required_pvs entirely when empty, so the step just
-# vanished at run time with a log line instead of blocking the run.
-blank_pvs = dict(app.DEFAULT_PVS)
-blank_pvs["mir_piezo_pitch"] = ""
-w4 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
-                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
-                         skip_mirror=False)
-entries = w4._required_pvs()
-flagged = [lbl for lbl, name, _rbv, _w in entries
-           if "piezo pitch" in lbl.lower() and not name]
-R.check(bool(flagged),
-        "a blank mirror piezo PV is reported to pre-flight, not skipped: %s" % flagged)
-
-# ...and it disappears again once the step that needs it is switched off.
-w5 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
-                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
-                         skip_mirror=True,
-                         enabled={"1_1a"})
-still = [lbl for lbl, name, _rbv, _w in w5._required_pvs()
-         if "piezo pitch" in lbl.lower() and not name and "mirror" in lbl.lower()]
-R.check(not still,
-        "pre-flight does not demand a PV no enabled step uses: %s" % still)
+# ...and it lets the scan through once the shutter is open.
+w7 = app.AlignmentWorker(dict(app.DEFAULT_PVS), dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False)
+w7.epics.get = lambda pv, as_string=False, timeout=3.0: 0.0
+faults7 = []
+w7.pv_fault.connect(lambda pv, c, r: faults7.append(r))
+w7._require_beam("3_3b")
+R.check(not faults7, "an open shutter raises nothing")
 
 R.finish()
