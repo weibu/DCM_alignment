@@ -258,6 +258,51 @@ R.check(done_btn.get("ok") is True, "the chapter run button's run completes")
 win.alignment_tab.set_all_enabled(True)
 R.check(win.alignment_tab.enabled_keys() == all_keys, "set_all_enabled restores everything")
 
+# ── 4F. Reopening the mirror slits used to happen as an unnamed action outside
+#    the 4E guard: no step row, no tick box, and it ran even with 4E off.
+R.check("4_4F" in win.alignment_tab._substep_chk, "4F has a tick box of its own")
+R.check("4_4F" in app.AlignmentTab._SUBSTEP_TEXT, "4F has a step-list label")
+
+slit_target = win.mirror_tab.get_mirror_scan_params()["mir_slit_size_c"]
+R.check(abs(app.DEFAULT_MIRROR_SCAN["mir_slit_size_c"] - 1.0) < 1e-9,
+        "the shipped default vertical extent is 1 mm (got %s)"
+        % app.DEFAULT_MIRROR_SCAN["mir_slit_size_c"])
+
+WR = []
+_rp = app.EpicsInterface.put
+
+
+def _rec(self, pv, value, wait=True, timeout=30.0):
+    WR.append((pv, value))
+    return _rp(self, pv, value, wait=wait, timeout=timeout)
+
+
+app.EpicsInterface.put = _rec
+top = win.get_pvs()["mir_slit_top"]
+bot = win.get_pvs()["mir_slit_bot"]
+
+_all = set(win.alignment_tab._substep_chk)
+ok4f, seen4f = run_with(_all)
+R.check(ok4f is True, "a run with 4F enabled completes")
+R.check(("4_4F", "done") in seen4f, "4F reports done")
+gap = [abs(v - bv) for (p1, v), (p2, bv) in zip(WR, WR[1:])
+       if p1 == top and p2 == bot]
+R.check(gap and abs(gap[-1] - slit_target) < 1e-6,
+        "the last slit move opens to %s mm (got %s)"
+        % (slit_target, gap[-1] if gap else None))
+
+WR[:] = []
+ok_no, seen_no = run_with(_all - {"4_4F"})
+R.check(ok_no is True, "a run with 4F disabled completes")
+R.check(("4_4F", "skipped") in seen_no, "4F reports itself skipped")
+gap_no = [abs(v - bv) for (p1, v), (p2, bv) in zip(WR, WR[1:])
+          if p1 == top and p2 == bot]
+R.check(not gap_no or abs(gap_no[-1] - slit_target) > 1e-6,
+        "with 4F off the slits are not opened (last gap %s)"
+        % (gap_no[-1] if gap_no else None))
+
+app.EpicsInterface.put = _rp
+
 # _apply_theme used to reach for the theme label with findChild(QLabel, ""),
 # which could return None.
 try:

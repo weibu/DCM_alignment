@@ -630,7 +630,7 @@ DEFAULT_MIRROR_SCAN = {
     "mir_vfm_start":      -250.0,
     "mir_vfm_stop":        250.0,
     "mir_vfm_steps":       21,
-    "mir_slit_size_c":    2.0,
+    "mir_slit_size_c":    1.0,
     "jjc_size_pre_feedback": 0.4,
     # 4C now steps the VDM pitch motor (urad), not the piezo (DCOM ~5), so it
     # needs its own range rather than reusing mir_piezo_*.
@@ -2055,7 +2055,7 @@ class AlignmentWorker(QObject):
             slit_cen_stop  = p.get("mir_slit_cen_stop", 2.0)
             slit_cen_steps = int(p.get("mir_slit_cen_steps", 21))
             slit_size_b    = p.get("mir_slit_size_b", 0.2)
-            slit_size_c    = p.get("mir_slit_size_c", 2.0)
+            slit_size_c    = p.get("mir_slit_size_c", 1.0)
             vdm_start      = p.get("mir_vdm_start", -500.0)
             vdm_stop       = p.get("mir_vdm_stop", 500.0)
             vdm_steps      = int(p.get("mir_vdm_steps", 21))
@@ -2267,12 +2267,21 @@ class AlignmentWorker(QObject):
                 if not self.request_confirm("4_4E"): return self._abort_cleanup()
                 self.substep_status.emit("4_4E", "done")
 
-            if top_pv and bot_pv:
-                self.log(f"  Opening slit to {slit_size_c} mm after 4E")
-                self._write(top_pv, slit_peak + slit_size_c / 2.0, "4E — reopen slit top")
-                self._write(bot_pv, slit_peak - slit_size_c / 2.0, "4E — reopen slit bottom")
-                if not self._wait_motor_done(top_pv): return self._abort_cleanup()
-                if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+            # ── 4F: Reopen the mirror slits ─────────────────────
+            if not self._skip("4_4F"):
+                self.substep_status.emit("4_4F", "running")
+                if top_pv and bot_pv:
+                    self.log(f"  4F: Opening the mirror slits to {slit_size_c} mm")
+                    self._write(top_pv, slit_peak + slit_size_c / 2.0,
+                                "4F — open slit top")
+                    self._write(bot_pv, slit_peak - slit_size_c / 2.0,
+                                "4F — open slit bottom")
+                    if not self._wait_motor_done(top_pv): return self._abort_cleanup()
+                    if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
+                    self.log(f"  Mirror slits open to {slit_size_c} mm.", "ok")
+                else:
+                    self.log("  Slit PVs not configured — skipping 4F.", "error")
+                self.substep_status.emit("4_4F", "done")
 
             self.step_status.emit(4, "done")
             self.log("Step 4 complete.", "ok")
@@ -4277,6 +4286,7 @@ class AlignmentTab(QWidget):
         "4_4C": "Mirror pitch motor scan → BPM y = 0",
         "4_4D": "VDM:Y scan → peak",
         "4_4E": "Coupled VFM:Y+VDM:Y → peak",
+        "4_4F": "Open mirror slits",
         "5_5mir": "Mirror in",
         "5_5jjc": "Close JJC slit before feedback",
         "5_5a": "Turn on H feedback",
@@ -4417,7 +4427,8 @@ class AlignmentTab(QWidget):
               ("4B2", "Centre mirror piezo at 5"),
               ("4C", "Mirror pitch motor scan → BPM y = 0"),
               ("4D", "VDM:Y scan → peak"),
-              ("4E", "Coupled VFM:Y+VDM:Y → peak")]),
+              ("4E", "Coupled VFM:Y+VDM:Y → peak"),
+              ("4F", "Open mirror slits")]),
             (5, "Enable Feedback Loops",
              [("5mir", "Mirror in"),
               ("5jjc", "Close JJC slit before feedback"),
@@ -5081,7 +5092,7 @@ class MirrorTab(QWidget):
             ("mir_vfm_start",      "VFM scan start offset", QDoubleSpinBox, -5000., 0.,  -250.,  1),
             ("mir_vfm_stop",       "VFM scan stop offset",  QDoubleSpinBox,  0., 5000.,   250.,  1),
             ("mir_vfm_steps",      "VFM scan steps",        QSpinBox,        3,    200,    21,   0),
-            ("mir_slit_size_c",    "Slit size after 4E (mm)", QDoubleSpinBox, 0.01, 20.0,  2.0,  3),
+            ("mir_slit_size_c",    "Slit size 4F (mm)",       QDoubleSpinBox, 0.01, 20.0,  1.0,  3),
             ("jjc_size_pre_feedback", "JJC size before feedback (mm)", QDoubleSpinBox, 0.0, 20.0, 0.4, 3),
             ("mir_pitch_start",    "Pitch motor scan start (µrad)", QDoubleSpinBox, -5000., 0.,  -50., 1),
             ("mir_pitch_stop",     "Pitch motor scan stop (µrad)",  QDoubleSpinBox,  0., 5000.,   50., 1),
@@ -5113,7 +5124,8 @@ class MirrorTab(QWidget):
             "<b>4B2</b> Centre the mirror pitch piezo at 5 (mid-range).<br>"
             "<b>4C</b> Mirror pitch scan: narrow slit → scan the mirror pitch motor → BPM y = 0.<br>"
             "<b>4D</b> VDM:Y scan: scan VDM:Y → signal peak → move.<br>"
-            "<b>4E</b> Coupled VFM+VDM scan: scan VFM:Y with VDM step = 2× VFM step → move both to peak."
+            "<b>4E</b> Coupled VFM+VDM scan: scan VFM:Y with VDM step = 2× VFM step → move both to peak.<br>"
+            "<b>4F</b> Open the mirror slits back to their working vertical extent."
         )
         proc_lbl.setWordWrap(True)
         proc_lbl.setTextFormat(Qt.TextFormat.RichText)
