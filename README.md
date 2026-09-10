@@ -131,14 +131,19 @@ Each scan added to a figure gets its own colour, its own legend entry and its
 own peak/zero marker in the matching colour. Trace colours are fixed and do not
 change with the theme, so a colour means the same trace in every screenshot.
 
-**Follow scan** (top right of the device tabs) brings the running scan's figure
-forward in the *left* pane and switches the device tab to match. The right pane
-is always yours. If you pick a tab yourself during a run, Follow switches itself
-off so the app stops moving the view; it re-arms at the start of the next run,
-when you click Proceed, or when you tick the box again. A figure that received a
-scan while hidden is marked with a ● on its tab.
+The two panes have fixed roles, labelled above each one:
 
-Figures clear at the start of each run.
+- **LIVE SCAN** (left) always shows whatever is scanning. When a scan starts the
+  device tab switches to its device and the pane brings its figure forward,
+  every time. There is no opt-out — if you move it, the next scan takes it back.
+- **BROWSE** (right) is yours. The app never changes it, including between
+  runs, so you can park a finished scan there and keep it in view.
+
+Both panes are independent views of the same data, so the same figure may be
+open in both, each with its own zoom.
+
+The live pane resets to the first figure at the start of each run; the browse
+pane stays where you left it. Figure data clears at the start of each run.
 
 ## PV Fault Handling
 

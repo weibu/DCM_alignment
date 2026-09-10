@@ -4102,9 +4102,7 @@ class FigurePane(QTabWidget):
     def _on_current_changed(self, index):
         self._build_page(index)
         if 0 <= index < len(self._order):
-            fig_id = self._order[index]
-            self.set_activity(fig_id, False)
-            self.figure_selected.emit(fig_id)
+            self.figure_selected.emit(self._order[index])
 
     def show_figure(self, fig_id):
         if fig_id in self._order:
@@ -4113,17 +4111,6 @@ class FigurePane(QTabWidget):
     def current_fig(self):
         i = self.currentIndex()
         return self._order[i] if 0 <= i < len(self._order) else None
-
-    def set_activity(self, fig_id, on):
-        if fig_id not in self._order:
-            return
-        i = self._order.index(fig_id)
-        base = self._models[i].tab_text
-        self.setTabText(i, ("● " + base) if on else base)
-
-    def clear_activity(self):
-        for fig_id in self._order:
-            self.set_activity(fig_id, False)
 
     def refresh_theme(self):
         # The global QSS tab rule (8px/20px, 12pt) is far too heavy for two
@@ -4139,7 +4126,20 @@ class FigurePane(QTabWidget):
 
 
 class DeviceSplitView(QWidget):
-    """Two independently-tabbed panes over one device's figures."""
+    """Two panes over one device's figures: a live one and a browser.
+
+    The left pane always shows whatever is scanning; the right is the
+    operator's and the app never changes it. The captions say so, because the
+    previous version expressed this through a checkbox in the tab-bar corner
+    that nobody found.
+    """
+
+    @staticmethod
+    def _caption(text, colour_key="text_dim"):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {PAL[colour_key]}; font-size: 10px;"
+                          f" letter-spacing: 1px; padding: 0 2px;")
+        return lbl
 
     def __init__(self, device, models, parent=None):
         super().__init__(parent)
@@ -4149,19 +4149,23 @@ class DeviceSplitView(QWidget):
         split.setChildrenCollapsible(False)
         self.left  = FigurePane(device, models)
         self.right = FigurePane(device, models)
-        split.addWidget(self.left)
-        split.addWidget(self.right)
+        for pane, text, key in ((self.left,  "LIVE SCAN", "cyan"),
+                                (self.right, "BROWSE",    "text_dim")):
+            box = QWidget()
+            col = QVBoxLayout(box)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(2)
+            col.addWidget(self._caption(text, key))
+            col.addWidget(pane, 1)
+            split.addWidget(box)
         split.setSizes([1, 1])
         lay.addWidget(split)
         if self.right.count() > 1:
             self.right.setCurrentIndex(1)
 
     def reset_selection(self):
+        """Only the live pane resets; the browser stays where it was parked."""
         self.left.setCurrentIndex(0)
-        if self.right.count() > 1:
-            self.right.setCurrentIndex(1)
-        self.left.clear_activity()
-        self.right.clear_activity()
 
     def refresh_theme(self):
         self.left.refresh_theme()
@@ -4180,8 +4184,6 @@ class ScanPlotBoard(QWidget):
                                 x_label, y_label, fill, self)
             self._models[fig_id] = model
             order.append(model)
-        self._suppress = False
-        self._follow   = True
         self._running  = False
         self._meta     = {}
 
@@ -4194,38 +4196,11 @@ class ScanPlotBoard(QWidget):
             view = DeviceSplitView(device, order)
             self._devices[device] = view
             self._device_tabs.addTab(view, device)
-            view.left.figure_selected.connect(self._on_manual_change)
-            view.right.figure_selected.connect(self._on_manual_change)
-        self._follow_chk = QCheckBox("Follow scan")
-        self._follow_chk.setChecked(True)
-        self._follow_chk.setToolTip(
-            "Bring the running scan's figure forward in the left pane.\n"
-            "Clears itself if you pick a tab yourself during a run.")
-        self._follow_chk.toggled.connect(self._on_follow_toggled)
-        self._device_tabs.setCornerWidget(self._follow_chk,
-                                          Qt.Corner.TopRightCorner)
-        self._device_tabs.currentChanged.connect(self._on_manual_change)
         lay.addWidget(self._device_tabs)
         self.setMinimumHeight(280)
         self.refresh_theme()
 
     # ── focus policy ─────────────────────────────────────────
-
-    def _on_manual_change(self, *_a):
-        # Programmatic changes are wrapped in _suppress, so reaching here during
-        # a run means the operator moved a tab and does not want to be followed.
-        if not self._suppress and self._running:
-            self.set_follow(False)
-
-    def _on_follow_toggled(self, on):
-        self._follow = bool(on)
-
-    def set_follow(self, on):
-        self._follow = bool(on)
-        if self._follow_chk.isChecked() != self._follow:
-            self._follow_chk.blockSignals(True)
-            self._follow_chk.setChecked(self._follow)
-            self._follow_chk.blockSignals(False)
 
     def on_substep(self, substep_key, status):
         route = _SCAN_ROUTES.get(substep_key)
@@ -4234,18 +4209,11 @@ class ScanPlotBoard(QWidget):
         fig_id = route[0]
         device = self._models[fig_id].device
         panes  = self._devices[device]
-        if not self._running or not self._follow:
-            target = panes.right if panes.right.current_fig() == fig_id else panes.left
-            target.set_activity(fig_id, True)
-            return
-        self._suppress = True
-        try:
-            self._device_tabs.setCurrentWidget(panes)
-            # If the operator already has it up on the right, leave the left alone.
-            if panes.right.current_fig() != fig_id:
-                panes.left.show_figure(fig_id)
-        finally:
-            self._suppress = False
+        # Unconditional. This used to skip the left pane when the right pane
+        # already showed the figure, which meant 3C and 4C moved nothing at all
+        # and the scan appeared not to be plotted anywhere.
+        self._device_tabs.setCurrentWidget(panes)
+        panes.left.show_figure(fig_id)
 
     # ── data in ──────────────────────────────────────────────
 
@@ -4267,21 +4235,13 @@ class ScanPlotBoard(QWidget):
         self._meta = dict(meta or {})
         for model in self._models.values():
             model.clear()
-        self._suppress = True
-        try:
-            for view in self._devices.values():
-                view.reset_selection()
-            self._device_tabs.setCurrentIndex(0)
-        finally:
-            self._suppress = False
+        for view in self._devices.values():
+            view.reset_selection()
+        self._device_tabs.setCurrentIndex(0)
         self._running = True
-        self.set_follow(True)
 
     def end_run(self):
         self._running = False
-        for view in self._devices.values():
-            view.left.clear_activity()
-            view.right.clear_activity()
 
     # ── misc ─────────────────────────────────────────────────
 
@@ -4939,9 +4899,6 @@ class AlignmentTab(QWidget):
     def _proceed_clicked(self):
         if self._faulted or self._fault_dlg is not None:
             return   # resolve the PV fault first
-        # A confirm pause is exactly when the operator browses figures by hand,
-        # which disarms Follow. They have just said "carry on", so re-arm it.
-        self._plot_board.set_follow(True)
         self.proceed_btn.setEnabled(False)
         self.proceed_btn.setVisible(False)
         if self._worker:
@@ -4981,7 +4938,6 @@ class AlignmentTab(QWidget):
 
     def _on_pv_fault(self, pv, context, reason):
         self._faulted = True
-        self._plot_board.set_follow(False)   # let the operator inspect freely
         self._fault_rows.append(
             (pv, context, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         self.proceed_btn.setEnabled(False)

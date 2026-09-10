@@ -168,6 +168,48 @@ R.check(isinstance(snap, dict) and len(snap.get("figures", [])) == 8
         and snap.get("meta", {}).get("row"),
         "snapshot() returns the run as plain data for a future history tab")
 
+# ── Focus. The left pane must show the running scan every time. This used to
+#    skip the left pane whenever the right pane already showed that figure, so
+#    3C and 4C moved nothing at all and the scan looked like it vanished.
+focus = []
+right_seen = set()
+
+
+def _watch(key, status):
+    if status != "running" or key not in app._SCAN_ROUTES:
+        return
+    fig = app._SCAN_ROUTES[key][0]
+    dev = board.model(fig).device
+    shown_dev = board._device_tabs.tabText(board._device_tabs.currentIndex()).strip()
+    panes = board._devices[dev]
+    focus.append((key, fig, dev, shown_dev, panes.left.current_fig()))
+    right_seen.add((dev, panes.right.current_fig()))
+
+
+win.setup_tab.sim_check.setChecked(True)
+win.energy_tab.table.selectRow(0)
+win.alignment_tab.set_chapter_enabled(4, True)
+_done = {}
+win.alignment_tab.alignment_done.connect(lambda ok: _done.setdefault("ok", ok))
+right_before = {d: v.right.current_fig() for d, v in board._devices.items()}
+win._start_alignment()
+win.alignment_tab._worker.substep_status.connect(_watch)
+H.pump(lambda: "ok" in _done, 180000)
+
+R.check(_done.get("ok") is True, "the focus-tracking run completes")
+R.check(len(focus) == 9, "all nine scans were observed starting (%d)" % len(focus))
+wrong_tab = [(k, d, sd) for k, f, d, sd, lp in focus if d != sd]
+R.check(not wrong_tab, "the device tab follows every scan%s"
+        % (" (wrong: %s)" % wrong_tab if wrong_tab else ""))
+wrong_pane = [(k, f, lp) for k, f, d, sd, lp in focus if lp != f]
+R.check(not wrong_pane, "the left pane shows every running scan%s"
+        % (" (wrong: %s)" % wrong_pane if wrong_pane else ""))
+
+right_after = {d: v.right.current_fig() for d, v in board._devices.items()}
+R.check(right_after == right_before,
+        "the browse pane is never moved by a run (%s -> %s)"
+        % (right_before, right_after))
+
 # ── Per-step enable. Every substep is now gated, and a disabled producer means
 #    its consumer works from the live position rather than a remembered result.
 def run_with(enabled):
