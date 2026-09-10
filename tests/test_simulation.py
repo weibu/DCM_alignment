@@ -16,9 +16,14 @@ qapp = H.qapp()
 win = app.MainWindow()
 win.show()
 
-# DEFAULT_PVS leaves mir_piezo_pitch blank, and the sequence correctly skips 4C
-# and 5C when it is unconfigured. Fill it in so a run exercises all nine scans.
-win.set_pv("mir_piezo_pitch", "SIM:mirror:piezo:pitch")
+# mir_piezo_pitch used to ship blank, which silently skipped 4B2 and 5C on a
+# fresh config -- the run "succeeded" with two steps quietly missing. Every PV a
+# scan drives must have a real default.
+_blank = [k for k in ("mir_piezo_pitch", "mir_pitch_motor", "piezo_pitch",
+                      "piezo_roll", "bpm_x", "bpm_y", "mir_slit_top", "mir_slit_bot")
+          if not (app.DEFAULT_PVS.get(k) or "").strip()]
+R.check(not _blank, "no PV a scan drives ships blank%s"
+        % (" (blank: %s)" % _blank if _blank else ""))
 
 
 def run_sequence(skip_mirror, confirm):

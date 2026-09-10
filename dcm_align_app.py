@@ -431,7 +431,7 @@ DEFAULT_PVS = {
     "und_energy_rbv":   "S15ID:USID:EnergyM",
     "mir_slit_top":     "15IDA:m9",
     "mir_slit_bot":     "15IDA:m10",
-    "mir_piezo_pitch":  "",
+    "mir_piezo_pitch":  "ID15A1:DMS:VDM:FIPI:DCOM",
     "mir_pitch_motor":  "ID15A1:DMS:VDM:PI",
     "ion_chamber":      "",
     "mir_slit_center":  "",
@@ -1618,15 +1618,17 @@ class AlignmentWorker(QObject):
         add("Mono energy",     pvs.get("mono_energy"), try_rbv=True, writable=True)
         add("DCM roll",        pvs.get("roll"),  try_rbv=True, writable=True)
         add("DCM pitch",       pvs.get("pitch"), try_rbv=True, writable=True)
-        add("DCM piezo pitch", pvs.get("piezo_pitch"), writable=True)
+        add("DCM piezo pitch", pvs.get("piezo_pitch"), writable=True)  # 3A and 5B
         add("DCM piezo roll",  pvs.get("piezo_roll"), writable=True)
         add("DCM scan signal", self._signal_pv("dcm_signal"))
         add("BPM X",           pvs.get("bpm_x"))
         add("BPM Y",           pvs.get("bpm_y"))
         add("BPM intensity",   pvs.get("bpm_intensity"))
-        # 5C drives the mirror pitch piezo whether or not Step 4 ran.
-        if (pvs.get("mir_piezo_pitch") or "").strip():
-            add("Mirror piezo pitch", pvs["mir_piezo_pitch"], writable=True)
+        # 5C drives the mirror pitch piezo whether or not Step 4 ran, and 4B2
+        # centres it. Added even when blank: a step that is switched on but has
+        # no PV should stop pre-flight, not vanish with a log line.
+        if self._step_on("5_5c") or (not self.skip_mirror and self._step_on("4_4B2")):
+            add("Mirror piezo pitch", pvs.get("mir_piezo_pitch"), writable=True)
 
         # Mirror stages are driven at 2C unconditionally, and again at 4B or 5.
         for stage in self.mirror_stages:
@@ -1646,8 +1648,8 @@ class AlignmentWorker(QObject):
             if top and bot:      # mirrors the `if top_pv and bot_pv` guard in 4A
                 add("Mirror slit top",    top, try_rbv=True, writable=True)
                 add("Mirror slit bottom", bot, try_rbv=True, writable=True)
-            if (pvs.get("mir_pitch_motor") or "").strip():
-                add("Mirror pitch motor", pvs["mir_pitch_motor"],
+            if self._step_on("4_4C"):
+                add("Mirror pitch motor", pvs.get("mir_pitch_motor"),
                     try_rbv=True, writable=True)
             vdm_pv, vfm_pv = self._mirror_yz_pvs()
             add("VDM:Y", vdm_pv, try_rbv=True, writable=True)
@@ -2073,7 +2075,7 @@ class AlignmentWorker(QObject):
                     if not self._wait_motor_done(top_pv): return self._abort_cleanup()
                     if not self._wait_motor_done(bot_pv): return self._abort_cleanup()
                 else:
-                    self.log("  Slit PVs not configured — skipping 4A slit scan.", "warn")
+                    self.log("  Slit PVs not configured — skipping 4A slit scan.", "error")
                 self.substep_status.emit("4_4A", "waiting")
                 if not self.request_confirm("4_4A"): return self._abort_cleanup()
                 self.substep_status.emit("4_4A", "done")
@@ -2109,7 +2111,7 @@ class AlignmentWorker(QObject):
                     self.log(f"  [{mir_piezo_pv}] → {centre}  (mirror piezo centred)", "ok")
                     if not self._sleep(0.3): return self._abort_cleanup()
                 else:
-                    self.log("  Mirror piezo pitch PV not configured — skipping 4B2.", "warn")
+                    self.log("  Mirror piezo pitch PV not configured — skipping 4B2.", "error")
                 self.substep_status.emit("4_4B2", "done")
 
             # ── 4C: Close slit → pitch motor → BPMY = 0 ────────────
@@ -2151,7 +2153,7 @@ class AlignmentWorker(QObject):
                     if not self._wait_motor_done(mir_pitch_pv): return self._abort_cleanup()
                     self.log(f"  BPMY zero-crossing at pitch = {pitch_zero:.3f} µrad → moved", "ok")
                 else:
-                    self.log("  Mirror pitch motor PV not configured — skipping BPMY centering.", "warn")
+                    self.log("  Mirror pitch motor PV not configured — skipping BPMY centering.", "error")
                 self.substep_status.emit("4_4C", "waiting")
                 if not self.request_confirm("4_4C"): return self._abort_cleanup()
                 self.substep_status.emit("4_4C", "done")
@@ -2321,7 +2323,7 @@ class AlignmentWorker(QObject):
                 self._write(dcm_piezo_pv, dcm_piezo_peak, "5B — move DCM piezo to the peak")
                 self.log(f"  Intensity peak at DCM piezo = {dcm_piezo_peak:.5f} → moved", "ok")
             else:
-                self.log("  DCM piezo pitch PV not configured — skipping.", "warn")
+                self.log("  DCM piezo pitch PV not configured — skipping.", "error")
             self.substep_status.emit("5_5b", "waiting")
             if not self.request_confirm("5_5b"): return self._abort_cleanup()
             self.substep_status.emit("5_5b", "done")
@@ -2355,7 +2357,7 @@ class AlignmentWorker(QObject):
                             "5C — move mirror piezo to the BPM Y zero-crossing")
                 self.log(f"  BPM y zero-crossing at mirror piezo = {mp_zero:.5f} → moved", "ok")
             else:
-                self.log("  Mirror piezo pitch PV not configured — skipping.", "warn")
+                self.log("  Mirror piezo pitch PV not configured — skipping.", "error")
             self.substep_status.emit("5_5c", "waiting")
             if not self.request_confirm("5_5c"): return self._abort_cleanup()
             self.substep_status.emit("5_5c", "done")

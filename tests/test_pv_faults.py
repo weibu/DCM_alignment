@@ -243,4 +243,54 @@ R.check(raised3 and caught3 and "has not started" in caught3[0],
         "a setpoint the motor never acts on is caught by the start grace: %r"
         % (caught3[0] if caught3 else None))
 
+# -- a PV an enabled step needs, but which is blank, must reach pre-flight ---
+# It used to be omitted from _required_pvs entirely when empty, so the step just
+# vanished at run time with a log line instead of blocking the run.
+blank_pvs = dict(app.DEFAULT_PVS)
+blank_pvs["mir_piezo_pitch"] = ""
+w4 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
+                         skip_mirror=False)
+entries = w4._required_pvs()
+flagged = [lbl for lbl, name, _rbv, _w in entries
+           if "piezo pitch" in lbl.lower() and not name]
+R.check(bool(flagged),
+        "a blank mirror piezo PV is reported to pre-flight, not skipped: %s" % flagged)
+
+# ...and it disappears again once the step that needs it is switched off.
+w5 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
+                         skip_mirror=True,
+                         enabled={"1_1a"})
+still = [lbl for lbl, name, _rbv, _w in w5._required_pvs()
+         if "piezo pitch" in lbl.lower() and not name and "mirror" in lbl.lower()]
+R.check(not still,
+        "pre-flight does not demand a PV no enabled step uses: %s" % still)
+
+R.finish()
+
+# -- a PV an enabled step needs, but which is blank, must reach pre-flight ---
+# It used to be omitted from _required_pvs entirely when empty, so the step just
+# vanished at run time with a log line instead of blocking the run.
+blank_pvs = dict(app.DEFAULT_PVS)
+blank_pvs["mir_piezo_pitch"] = ""
+w4 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
+                         skip_mirror=False)
+entries = w4._required_pvs()
+flagged = [lbl for lbl, name, _rbv, _w in entries
+           if "piezo pitch" in lbl.lower() and not name]
+R.check(bool(flagged),
+        "a blank mirror piezo PV is reported to pre-flight, not skipped: %s" % flagged)
+
+# ...and it disappears again once the step that needs it is switched off.
+w5 = app.AlignmentWorker(blank_pvs, dict(app.DEFAULT_SCAN),
+                         dict(app.DEFAULT_LOOKUP[0]), simulate=False,
+                         skip_mirror=True,
+                         enabled={"1_1a"})
+still = [lbl for lbl, name, _rbv, _w in w5._required_pvs()
+         if "piezo pitch" in lbl.lower() and not name and "mirror" in lbl.lower()]
+R.check(not still,
+        "pre-flight does not demand a PV no enabled step uses: %s" % still)
+
 R.finish()
