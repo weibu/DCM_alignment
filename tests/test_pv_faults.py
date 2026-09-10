@@ -21,7 +21,8 @@ try:
 except ImportError:
     pass
 
-STATE = {"probe_ok": False, "get_ok": True, "puts": [], "described": []}
+STATE = {"probe_ok": False, "get_ok": True, "puts": [], "described": [],
+         "scan_pv": None, "scan_i": 0}
 
 app.probe_pv = lambda pv, timeout=2.0, try_rbv=False: (
     (True, "ok") if STATE["probe_ok"] else (False, "timeout"))
@@ -35,6 +36,9 @@ _SETTLED = ((".DMOV", 1.0), (".MOVN", 0.0), (".MSTA", 2.0), (".LVIO", 0.0),
 _IDLE_PVS = {app.DEFAULT_PVS["und_busy"]: 0.0}      # undulator not moving
 
 
+_BPM_PVS = {app.DEFAULT_PVS["bpm_x"], app.DEFAULT_PVS["bpm_y"]}
+
+
 def fake_get(self, pv, as_string=False, timeout=3.0):
     if self.simulate:
         return self._sim_vals.get(pv, 0.0)
@@ -45,6 +49,11 @@ def fake_get(self, pv, as_string=False, timeout=3.0):
     for suffix, val in _SETTLED:
         if pv.endswith(suffix):
             return val
+    if pv in _BPM_PVS:
+        # A ramp that crosses zero on the third point of whichever scan is
+        # running. _scan_to_zero now faults on a signal that never crosses, so
+        # a constant here would (correctly) stop every zero-crossing scan.
+        return float(3 - STATE["scan_i"])
     return 0.5
 
 
@@ -53,6 +62,10 @@ def fake_put(self, pv, value, wait=True, timeout=30.0):
         self._sim_vals[pv] = value
         return True, ""
     STATE["puts"].append((pv, value))
+    if pv == STATE["scan_pv"]:
+        STATE["scan_i"] += 1
+    else:                       # a different PV: a new scan has begun
+        STATE["scan_pv"], STATE["scan_i"] = pv, 0
     return True, ""
 
 
@@ -65,14 +78,14 @@ win.show()
 tab = win.alignment_tab
 win.setup_tab.sim_check.setChecked(False)   # hardware mode, but stubbed
 win.energy_tab.table.selectRow(0)
-tab.skip_mirror_chk.setChecked(True)
+tab.set_chapter_enabled(4, False)          # chapter 4 off, as before
 tab.confirm_chk.setChecked(False)
 # Keep the stubbed run short so a hang is obvious rather than just slow.
 for key, val in [("pitch_steps", 7), ("roll_steps", 7), ("dcm_piezo_steps", 5),
                  ("mir_piezo_steps", 5), ("smart_max_extend_steps", 2),
                  ("smart_fine_scan_iter", 1), ("settle_time", 0.0),
                  ("piezo_settle_time", 0.0)]:
-    win.setup_tab._scan_fields[key].setValue(val)
+    win.set_scan_param(key, val)
 
 # ═══ 1. Pre-flight blocks the run before anything moves ════════════════════
 STATE["probe_ok"] = False

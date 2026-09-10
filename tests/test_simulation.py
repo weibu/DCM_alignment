@@ -18,12 +18,12 @@ win.show()
 
 # DEFAULT_PVS leaves mir_piezo_pitch blank, and the sequence correctly skips 4C
 # and 5C when it is unconfigured. Fill it in so a run exercises all nine scans.
-win.setup_tab._pv_fields["mir_piezo_pitch"].setText("SIM:mirror:piezo:pitch")
+win.set_pv("mir_piezo_pitch", "SIM:mirror:piezo:pitch")
 
 
 def run_sequence(skip_mirror, confirm):
     """Run one full sequence to completion. Returns the success flag, or None on timeout."""
-    win.alignment_tab.skip_mirror_chk.setChecked(skip_mirror)
+    win.alignment_tab.set_chapter_enabled(4, not skip_mirror)
     win.alignment_tab.confirm_chk.setChecked(confirm)
     win.setup_tab.sim_check.setChecked(True)
     win.energy_tab.table.selectRow(0)
@@ -88,7 +88,7 @@ def recording_put(self, pv, value, wait=True, timeout=30.0):
 app.EpicsInterface.put = recording_put
 jjc_pv = next(st["pv"] for st in win.mirror_tab.get_mirror_stages()
               if "JJC" in st["name"] and "Size" in st["name"])
-fb_h = win.setup_tab.get_pvs()["feedback_h"]
+fb_h = win.get_pvs()["feedback_h"]
 target = win.mirror_tab.get_mirror_scan_params()["jjc_size_pre_feedback"]
 
 for skip in (True, False):
@@ -122,10 +122,17 @@ app.EpicsInterface.put = _real_put
 #    DCM pitch piezo, concatenating incompatible x scales into one polyline.
 board = win.alignment_tab._plot_board
 
-for fig_id, expected in (("dcm_pitch", 2), ("mir_piezo", 2)):
+# dcm_pitch overlays 3B+3D. mir_pitch (4C, µrad motor) and mir_piezo (5C, DCOM
+# piezo) are deliberately separate: since 4C moved to the pitch motor they no
+# longer share an x quantity and must not share an axis.
+for fig_id, expected in (("dcm_pitch", 2), ("mir_pitch", 1), ("mir_piezo", 1)):
     got = len(board.model(fig_id).order())
     R.check(got == expected,
-            "figure %r carries %d overlaid traces (got %d)" % (fig_id, expected, got))
+            "figure %r carries %d trace(s) (got %d)" % (fig_id, expected, got))
+
+R.check(board.model("mir_pitch").x_label != board.model("mir_piezo").x_label,
+        "4C and 5C are on figures with different x units (%r vs %r)"
+        % (board.model("mir_pitch").x_label, board.model("mir_piezo").x_label))
 
 empty = [f[0] for f in app._FIGURE_DEFS if board.model(f[0]).is_empty()]
 R.check(not empty,
@@ -152,9 +159,57 @@ R.check(all(len(sr.raw) == len(sr.xs) for f in app._FIGURE_DEFS
         "acquisition order is preserved alongside the sorted draw order")
 
 snap = board.snapshot()
-R.check(isinstance(snap, dict) and len(snap.get("figures", [])) == 7
+R.check(isinstance(snap, dict) and len(snap.get("figures", [])) == 8
         and snap.get("meta", {}).get("row"),
         "snapshot() returns the run as plain data for a future history tab")
+
+# ── Per-step enable. Every substep is now gated, and a disabled producer means
+#    its consumer works from the live position rather than a remembered result.
+def run_with(enabled):
+    """Run with an explicit enable set. Returns (ok, statuses seen)."""
+    seen = []
+    result = {}
+    win.setup_tab.sim_check.setChecked(True)
+    win.energy_tab.table.selectRow(0)
+    win.alignment_tab.alignment_done.connect(lambda ok: result.setdefault("ok", ok))
+    win._start_alignment(enabled=enabled)
+    win.alignment_tab._worker.substep_status.connect(
+        lambda k, st: seen.append((k, st)))
+    win.alignment_tab._worker.confirm_needed.connect(
+        lambda _k: H.QTimer.singleShot(10, win.alignment_tab._proceed_clicked))
+    H.pump(lambda: "ok" in result, 180000)
+    return result.get("ok"), seen
+
+
+all_keys = set(win.alignment_tab._substep_chk)
+
+# 4A produces slit_peak, which 4C and the post-4E reopen consume. It used to be
+# initialised inside 4A, so switching 4A off alone raised NameError.
+ok, seen = run_with(all_keys - {"4_4A"})
+R.check(ok is True, "a run with 4A disabled completes")
+R.check(("4_4A", "skipped") in seen, "4A reports itself skipped")
+R.check(("4_4C", "done") in seen, "4C still runs with 4A disabled")
+
+# A chapter-only run: chapter 3 plus chapter 1, which only logs the row.
+ch3 = set(win.alignment_tab._chapter_steps[3]) | set(win.alignment_tab._chapter_steps[1])
+ok, seen = run_with(ch3)
+R.check(ok is True, "a chapter-3-only run completes")
+ran = {k for k, st in seen if st == "done"}
+R.check(ran <= ch3, "a chapter-only run touches nothing outside that chapter: %s"
+        % sorted(ran - ch3))
+R.check({"3_3a", "3_3b", "3_3c", "3_3d"} <= ran, "all of chapter 3 ran: %s" % sorted(ran))
+
+# The chapter-run button must produce the same enable set.
+win.alignment_tab._run_chapter(3)
+H.pump(lambda: win.alignment_tab._running, 5000)
+R.check(win.alignment_tab._running, "the chapter run button starts a run")
+done_btn = {}
+win.alignment_tab.alignment_done.connect(lambda ok: done_btn.setdefault("ok", ok))
+H.pump(lambda: "ok" in done_btn, 180000)
+R.check(done_btn.get("ok") is True, "the chapter run button's run completes")
+
+win.alignment_tab.set_all_enabled(True)
+R.check(win.alignment_tab.enabled_keys() == all_keys, "set_all_enabled restores everything")
 
 # _apply_theme used to reach for the theme label with findChild(QLabel, ""),
 # which could return None.

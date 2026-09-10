@@ -23,20 +23,65 @@ stub and fails; use the `py` launcher.)
 
 | Tab | Purpose |
 |-----|---------|
-| **Setup** | Edit all motor PV names, scan parameters (range/steps/settle time, **DCM scan signal**), and toggle simulation vs. real EPICS |
-| **Energy Table** | Load/edit/import/export the lookup table (MonoE, UE, Roll, Pitch). Select a row before running. |
-| **Alignment** | Run the full 5-step sequence. Shows beam path indicator, live scan plots, BPM readouts, and log. |
-| **Mirror** | Placeholder for mirror alignment substeps (to be filled in when procedure is provided). |
+| **Energy Table** | The energy lookup table (MonoE, UE, harmonic, roll, pitch, detector sensitivities) and, below it, the record of past alignments. Select a row before running. |
+| **PV Monitor / Config** | Shared PVs — undulator, BPM, feedback, AutoFeedback, ion chamber — with live readbacks, the shared timeouts, Simulation mode, Test EPICS Connection, and Load/Save Config. |
+| **DCM Setup** | The DCM crystal motors and piezos, and every DCM scan parameter including the DCM scan signal. |
+| **Mirror Setup** | Everything mirror-related in one place: slit and pitch PVs, the mirror scan parameters, the stage in/out table, and the Step 4 procedure summary. |
+| **Alignment** | Run the sequence. Per-chapter and per-step tick boxes, a run button on each chapter, the beam-path indicator, tabbed scan figures, BPM readouts and the log. |
+| **Record** | Which PVs are written to the lookup table after a successful run. |
+
+All three settings tabs are the same panel with a different filter, so live
+readbacks, monitoring and config handling behave identically on each. The saved
+`dcm_config.json` is unchanged by the split — `pvs` and `scan` are still single
+flat dictionaries, so an existing config loads untouched.
 
 ## Alignment Steps
 
+The five top-level steps are called **chapters**. Every chapter clears
+`15IDA:userTran6.O` ("AutoFeedback") first — while that field is 1 the transform
+forces both feedback loops on (`.G = (a||o)&&...`, `.H = (b||o)&&...`) and any
+attempt to control them from here is ignored.
+
 | Step | Action |
 |------|--------|
-| 1 | Load MonoE, UE, Roll, Pitch from selected lookup table row |
-| 2 | Disable BPM H/V feedback → move motors to setpoints → retract mirror |
-| 3 | Center DCM piezos (pitch & roll → 5) → scan roll for BPM x = 0 → scan pitch for intensity peak |
-| 4 | Mirror alignment (placeholder — substeps TBD) |
-| 5 | Close JJC to its operating size → enable H feedback (piezo roll → BPM x=0) → maximise intensity (piezo pitch) → tweak mirror piezo pitch (BPM y=0) → enable V feedback |
+| 1 | Log MonoE, UE, roll and pitch from the selected row |
+| 2 | 2A feedback off → 2B undulator, mono, roll, pitch **and the row's detector sensitivities**, waiting for the undulator to arrive → 2C mirror out |
+| 3 | 3A centre DCM piezos at 5 → 3B pitch scan (peak) → 3C roll scan (BPM x = 0) → 3D pitch scan (peak) |
+| 4 | 4A slit scan → 4B mirror in → **4B2 centre the mirror pitch piezo at 5** → **4C mirror pitch motor scan (BPM y = 0)** → 4D VDM:Y peak → 4E coupled VFM:Y + VDM:Y |
+| 5 | Close the JJC → 5A H feedback on → 5B DCM piezo peak → 5C mirror piezo (BPM y = 0) → 5D V feedback on |
+
+4C drives the pitch **motor** (`ID15A1:DMS:VDM:PI`, µrad), not the piezo — 4B2
+parks the piezo mid-range first, mirroring what 3A/3C do for the DCM. Both piezo
+records report `DRVL=-2, DRVH=12`, so 5 is genuinely the middle.
+
+### Choosing what to run
+
+Every chapter and every step has a tick box in the left panel; unticking a
+chapter unticks its steps, and a partly-ticked chapter shows as such. The **▶**
+button on a chapter row runs that chapter on its own without disturbing the tick
+boxes. Selections reset to all-enabled each launch, so a forgotten unticked box
+cannot silently skip a step days later.
+
+A skipped step never leaves a later one stranded: where a step would have
+produced a value — 4A's slit centre, 3B's coarse pitch — the sequence reads the
+live position instead. The mirror is inserted before Step 5 whenever it is
+actually out, tracked from what ran rather than inferred from a checkbox.
+
+### Feedback during the sequence
+
+Both loops are off from 2A onward. Before every scan the app **reads** the
+feedback state back and, if a loop is on, turns it off and logs it. From 5A the
+H loop is deliberately on, so only V is asserted off; 5D enables V as the final
+handover.
+
+### Zero-crossing scans
+
+The three BPM-zero scans — 3C, 4C and 5C — start where you configure them and
+step at the configured step size, but have no pre-decided end: they stop as soon
+as **two points lie past the zero crossing**. If no crossing appears within three
+times the configured span the run pauses with the usual fault dialog. Previously
+they swept a fixed window and, if the crossing fell outside it, silently moved
+the motor to the closest-to-zero point.
 
 ### JJC slit size
 
@@ -153,10 +198,17 @@ mirror scans have their own **Signal source** selector on the Mirror tab.
 PV names and scan parameters are editable in the Setup tab. Use **Save Config…**
 and **Load Config…** to export/import `.json` configuration files.
 
-## Lookup Table Format (CSV)
+## Lookup Table
+
+Column headings word-wrap, and columns are resizable by dragging the dividers —
+a recorded row can carry 30-odd columns with names like
+"MonP Max Intensity w/o Mirror". Widths survive adding a record and are saved to
+`dcm_config.json`. The energy table and the mirror stage table are resizable too.
+
+### CSV format
 
 ```
-mono_e,ue,roll,pitch
-8.0,9.8,0.412,2.341
-10.0,12.1,0.398,2.187
+mono_e,ue,harmonic,roll,pitch,bpm_sen,ic_sen_unit,ic_sen_num
+8.0,8.02,1,-7670,1338,6,2,3
+10.0,10.03,1,-7671,1328,6,2,3
 ```
